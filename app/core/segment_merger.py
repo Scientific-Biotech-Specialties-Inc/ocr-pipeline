@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from PIL import Image
 from rapidfuzz import fuzz
 
-from app.core.anchors import DATE_RE, TAX_ID_RE
+from app.core.anchors import DATE_RE, TAX_ID_RE, score_text
 from app.core.numbers import normalize_money
 from app.core.ocr_engine import OcrReading, Word
 
@@ -115,6 +115,8 @@ def order_segments(
 
     best_perm: tuple[int, ...] | None = None
     best_score = -1e9
+    caller_perm = tuple(range(n))
+    caller_score = -1e9
 
     # Evaluate all candidate permutations (for n <= 6, n! <= 720)
     for perm in itertools.permutations(range(n)):
@@ -138,23 +140,49 @@ def order_segments(
                 score -= 3.0 * scores[mid_idx].header_score
 
         # Reward seam overlap transitions
+        seam_total = 0.0
         for step in range(n - 1):
-            score += pair_seam_scores.get((perm[step], perm[step + 1]), 0.0) * 4.0
+            seam_total += pair_seam_scores.get((perm[step], perm[step + 1]), 0.0)
+        score += seam_total * 4.0
 
-        # Small tie-breaking preference for the caller-provided file_urls order
-        if perm == tuple(range(n)):
-            score += 0.5
+        # Baseline bonus for caller order: strong bias to prevent false shuffling
+        if perm == caller_perm:
+            score += 3.0
+            caller_score = score
 
         if score > best_score:
             best_score = score
             best_perm = perm
 
-    if best_perm is None:
+    if best_perm is None or best_perm == caller_perm:
+        return segments
+
+    # Margin guard: require >= 3.0 score advantage AND clear rationale
+    caller_seam_total = sum(
+        pair_seam_scores.get((caller_perm[step], caller_perm[step + 1]), 0.0)
+        for step in range(n - 1)
+    )
+    best_seam_total = sum(
+        pair_seam_scores.get((best_perm[step], best_perm[step + 1]), 0.0)
+        for step in range(n - 1)
+    )
+    margin = best_score - caller_score
+    has_anchor_benefit = (
+        scores[best_perm[0]].header_score >= 2.0 and scores[caller_perm[0]].header_score < 2.0
+    ) or (
+        scores[best_perm[-1]].footer_score >= 2.0 and scores[caller_perm[-1]].footer_score < 2.0
+    )
+    has_seam_benefit = (best_seam_total - caller_seam_total) >= 1.5
+
+    if margin < 3.0 or not (has_anchor_benefit or has_seam_benefit):
+        logger.info(
+            "Auto-ordering candidate %s rejected by margin guard (margin=%.2f, caller_score=%.2f); keeping caller order",
+            list(best_perm), margin, caller_score,
+        )
         return segments
 
     ordered = [segments[idx] for idx in best_perm]
-    if tuple(best_perm) != tuple(range(n)):
-        logger.info("Auto-ordered segments from %s to %s (score=%.2f)", list(range(n)), list(best_perm), best_score)
+    logger.info("Auto-ordered segments from %s to %s (score=%.2f vs caller=%.2f)", list(caller_perm), list(best_perm), best_score, caller_score)
     return ordered
 
 
@@ -181,7 +209,7 @@ class LineFingerprint:
 
 
 def _evaluate_seam_overlap(
-    lines_prev: list[list[Word]], lines_next: list[list[Word]], max_window: int = 15
+    lines_prev: list[list[Word]], lines_next: list[list[Word]], max_window: int = 30
 ) -> float:
     """Quickly score overlap compatibility between tail of prev and head of next."""
     if not lines_prev or not lines_next:
@@ -193,10 +221,17 @@ def _evaluate_seam_overlap(
     overlap_score = 0.0
     for t in tail:
         for h in head:
-            # Tier 1: exact barcode match
-            if t.barcodes and h.barcodes and set(t.barcodes) & set(h.barcodes):
-                overlap_score += 2.0
-                continue
+            # Tier 1: exact barcode match or 7+ digit common suffix/substring
+            if t.barcodes and h.barcodes:
+                if set(t.barcodes) & set(h.barcodes):
+                    overlap_score += 2.0
+                    continue
+                if any(
+                    len(b1) >= 7 and len(b2) >= 7 and (b1 in b2 or b2 in b1 or b1[-7:] == b2[-7:])
+                    for b1 in t.barcodes for b2 in h.barcodes
+                ):
+                    overlap_score += 1.8
+                    continue
             # Tier 2: identical prices + high text similarity
             if t.prices and h.prices and t.prices == h.prices:
                 sim = fuzz.token_set_ratio(t.text, h.text)
@@ -223,7 +258,10 @@ def merge_segment_readings(
         raise ValueError("No segments to merge")
 
     if len(ordered_segments) == 1:
-        return ordered_segments[0][1], False
+        reading = ordered_segments[0][1]
+        if reading.anchors is None:
+            reading.anchors = score_text(reading.text, reading.confidence)
+        return reading, False
 
     unified_lines: list[list[Word]] = []
     cumulative_y_offset = 0
@@ -238,7 +276,7 @@ def merge_segment_readings(
             continue
 
         prev_lines = unified_lines
-        overlap_match = _find_best_overlap_alignment(prev_lines, curr_lines, max_window=18)
+        overlap_match = _find_best_overlap_alignment(prev_lines, curr_lines, max_window=30)
 
         if overlap_match is not None:
             prev_overlap_start, prev_overlap_end, next_overlap_start, next_overlap_end = overlap_match
@@ -308,6 +346,7 @@ def merge_segment_readings(
         engine=primary_engine,
         lines=unified_lines,
     )
+    merged_reading.anchors = score_text(unified_text, mean_conf)
     return merged_reading, gap_suspected
 
 
@@ -332,7 +371,7 @@ def _shift_line_y(line: list[Word], offset: int) -> list[Word]:
 def _find_best_overlap_alignment(
     lines_prev: list[list[Word]],
     lines_next: list[list[Word]],
-    max_window: int = 18,
+    max_window: int = 30,
 ) -> tuple[int, int, int, int] | None:
     """Find the exact slice coordinates (prev_start, prev_end, next_start, next_end) of overlap."""
     if not lines_prev or not lines_next:
@@ -386,9 +425,15 @@ def _find_best_overlap_alignment(
 
 def _match_fingerprints(f1: LineFingerprint, f2: LineFingerprint) -> float:
     """Score whether two lines represent the same printed receipt line."""
-    # 1. Barcode match
-    if f1.barcodes and f2.barcodes and set(f1.barcodes) & set(f2.barcodes):
-        return 3.0
+    # 1. Barcode match (exact or 7+ char common suffix/substring)
+    if f1.barcodes and f2.barcodes:
+        if set(f1.barcodes) & set(f2.barcodes):
+            return 3.0
+        if any(
+            len(b1) >= 7 and len(b2) >= 7 and (b1 in b2 or b2 in b1 or b1[-7:] == b2[-7:])
+            for b1 in f1.barcodes for b2 in f2.barcodes
+        ):
+            return 2.5
 
     # 2. Price match + text similarity
     if f1.prices and f2.prices and f1.prices == f2.prices:
@@ -411,6 +456,7 @@ def split_tall_image_into_strips(
     image: Image.Image,
     target_height: int = 1400,
     overlap_pct: float = 0.15,
+    max_strips: int = 4,
 ) -> list[Image.Image]:
     """Slice a single very tall receipt image into overlapping horizontal virtual strips.
 
@@ -430,8 +476,10 @@ def split_tall_image_into_strips(
     y = 0
     strip_idx = 0
 
-    while y < h:
+    while y < h and strip_idx < max_strips:
         bottom = min(y + strip_h, h)
+        if strip_idx == max_strips - 1:
+            bottom = h  # Last strip reaches all the way to bottom
         crop = image.crop((0, y, w, bottom))
         # Tag with metadata for merger
         crop._is_virtual_strip = True

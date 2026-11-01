@@ -28,6 +28,7 @@ from PIL import Image
 
 from app.api.schemas.ocr import build_callback_payload
 from app.config import settings
+from app.core.anchors import score_text
 from app.core.callback import send_callback
 from app.core.confidence import ConfidenceBreakdown, compute_confidence
 from app.core.extraction import Extraction, extract, fast_path_sufficient
@@ -44,7 +45,15 @@ from app.core.financial_semantics import (
     validate_financial_semantics,
 )
 from app.core.image_quality import NOT_A_RECEIPT_REASON
-from app.core.ocr_engine import OcrBundle, OcrReading, rank_candidates, read_pooled
+from app.core.ocr_engine import (
+    OcrBundle,
+    OcrReading,
+    ocr_executor,
+    rank_candidates,
+    read_pooled,
+    read_region_recovery,
+    read_segment_fast,
+)
 from app.core.pdf_handler import pdf_to_images
 from app.core.postprocessing import normalize_extraction
 from app.core.segment_merger import (
@@ -106,13 +115,16 @@ def load_images(file_bytes: bytes, file_url: str) -> list[Image.Image]:
 def is_likely_receipt(bundle: OcrBundle, extraction: Extraction) -> bool:
     """Evaluate whether the OCR output exhibits signals of a genuine receipt."""
     anchors = bundle.primary.anchors
+    if anchors is None:
+        anchors = score_text(bundle.combined_text, bundle.confidence)
     has_money = bool((anchors and anchors.money_tokens > 0) or extraction.fields.get("total_amount") is not None)
     has_keywords = bool(anchors and anchors.keyword_hits > 0)
     has_tax_id = bool((anchors and anchors.has_tax_id) or extraction.fields.get("vendor_tax_id") is not None)
     has_date = bool((anchors and anchors.has_date) or extraction.fields.get("transaction_date") is not None)
+    has_items = bool(extraction.item_scan and extraction.item_scan.count >= 2)
 
-    # If it has money, receipt keywords, or a tax id, it qualifies as a receipt
-    if has_money or has_keywords or has_tax_id:
+    # If it has money, receipt keywords, a tax id, or parsed items, it qualifies as a receipt
+    if has_money or has_keywords or has_tax_id or has_items:
         return True
 
     # If it has a date AND a vendor name with at least some words, it might be a simple slip
@@ -149,6 +161,20 @@ async def process_receipt(
                     segment_images.append(imgs[0])
             if len(segment_images) < 2:
                 raise ValueError("Failed to load at least 2 valid image segments")
+
+            # Sub-tile tall segments in multi-part uploads if virtual tiling is enabled
+            if settings.ocr_virtual_tiling:
+                expanded_segments: list[Image.Image] = []
+                for s_idx, s_img in enumerate(segment_images):
+                    strips = split_tall_image_into_strips(s_img, max_strips=3)
+                    if len(strips) > 1 and len(expanded_segments) + len(strips) <= 10:
+                        for strip in strips:
+                            strip._parent_segment_index = s_idx
+                        expanded_segments.extend(strips)
+                    else:
+                        expanded_segments.append(s_img)
+                segment_images = expanded_segments
+
             images = segment_images
         else:
             primary_url = file_url or (file_urls[0] if file_urls else "")
@@ -320,22 +346,26 @@ async def process_receipt(
             extraction.financial_semantics and extraction.financial_semantics.source == "qwen"
         )
         if not has_callback_semantics:
-            for key in ("tax_basis", "financial_reconciliation_status", "needs_manual_review"):
+            for key in ("tax_basis", "financial_reconciliation_status"):
                 callback_fields.pop(key, None)
+
+        needs_review = bool(
+            verification.needs_manual_review or extraction.fields.get("needs_manual_review", False)
+        )
+        fin_recon_status = extraction.fields.get("financial_reconciliation_status")
+        tax_basis_val = extraction.fields.get("tax_basis") if has_callback_semantics else None
+
         payload = build_callback_payload(
             receipt_id=receipt_id,
             fields=callback_fields,
             confidence=breakdown.score,
             status="rejected" if is_dup else "completed",
             items=extraction.item_scan.payload() if extraction.item_scan else [],
-            tax_basis=(extraction.fields.get("tax_basis") if has_callback_semantics else None),
+            tax_basis=tax_basis_val,
             financial_reconciliation_status=(
-                extraction.fields.get("financial_reconciliation_status")
-                if has_callback_semantics else None
+                fin_recon_status if has_callback_semantics else None
             ),
-            needs_manual_review=(
-                verification.needs_manual_review or extraction.fields.get("needs_manual_review", False)
-            ) if has_callback_semantics else None,
+            needs_manual_review=needs_review if needs_review else None,
             is_duplicate=is_dup,
             duplicate_similarity=dup_score,
             rejection_code="duplicate" if is_dup else None,
@@ -356,14 +386,11 @@ async def process_receipt(
                 "confidence": breakdown.score,
                 "callback_fields": callback_fields,
                 "items": extraction.item_scan.payload() if extraction.item_scan else [],
-                "tax_basis": extraction.fields.get("tax_basis") if has_callback_semantics else None,
+                "tax_basis": tax_basis_val,
                 "financial_reconciliation_status": (
-                    extraction.fields.get("financial_reconciliation_status")
-                    if has_callback_semantics else None
+                    fin_recon_status if has_callback_semantics else None
                 ),
-                "needs_manual_review": (
-                    verification.needs_manual_review or extraction.fields.get("needs_manual_review", False)
-                ) if has_callback_semantics else None,
+                "needs_manual_review": needs_review if needs_review else None,
             }
             await set_cached_ocr_result(content_hash, cache_data)
         except Exception as cache_exc:  # noqa: BLE001
@@ -499,18 +526,18 @@ async def _read_and_extract_segments(
     """
     metrics = {"engine": 0.0, "llm": 0.0}
 
-    # 1. Parallel Fast Pass across all segments
+    # 1. Fast Pass across all segments
     t0_engine = time.perf_counter()
-    tasks = [read_pooled(img, lang="eng", fast_path=True) for img in segment_images]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    metrics["engine"] += time.perf_counter() - t0_engine
-
+    loop = asyncio.get_running_loop()
     valid_pairs: list[tuple[Image.Image, OcrReading]] = []
-    for idx, res in enumerate(results):
-        if isinstance(res, Exception):
-            logger.warning("Segment %s fast OCR failed: %s", idx, res)
-            continue
-        valid_pairs.append((segment_images[idx], res.primary))
+    for idx, img in enumerate(segment_images):
+        try:
+            res = await loop.run_in_executor(ocr_executor, read_segment_fast, img, "eng")
+            valid_pairs.append((img, res))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Segment %s fast OCR failed: %s", idx, exc)
+
+    metrics["engine"] += time.perf_counter() - t0_engine
 
     if not valid_pairs:
         raise RuntimeError("All segments failed fast OCR")
@@ -546,30 +573,48 @@ async def _read_and_extract_segments(
         await normalize_extraction(baseline, merged_bundle, use_llm=False)
         return merged_bundle, baseline, metrics, gap_suspected
 
-    # 5. Selective escalation: re-run pooled OCR on segments with low confidence
-    logger.info("Multi-segment fast path insufficient; selectively evaluating pooled OCR")
-    t0_esc = time.perf_counter()
-    escalated_pairs: list[tuple[Image.Image, OcrReading]] = []
-    for img, reading in ordered_pairs:
-        if reading.confidence < 0.72 and not getattr(img, "_is_virtual_strip", False):
-            try:
-                pooled_b = await read_pooled(img, lang="eng", fast_path=False)
-                escalated_pairs.append((img, pooled_b.primary))
-            except Exception as exc:
-                logger.warning("Segment pooled escalation failed: %s", exc)
-                escalated_pairs.append((img, reading))
-        else:
-            escalated_pairs.append((img, reading))
-    metrics["engine"] += time.perf_counter() - t0_esc
-
-    if [id(r) for _, r in escalated_pairs] != [id(r) for _, r in ordered_pairs]:
-        merged_reading, gap_suspected = merge_segment_readings(escalated_pairs)
-        merged_bundle = OcrBundle(
-            primary=merged_reading,
-            supporting=[],
-            all_readings=[merged_reading],
-            early_exit=False,
+    # 5. Targeted region recovery: contrast-enhanced crop OCR for missing header/footer
+    needs_total_recovery = baseline.fields.get("total_amount") is None or not baseline.reconciled
+    needs_vendor_recovery = (
+        baseline.fields.get("vendor_name") is None and baseline.fields.get("vendor_tax_id") is None
+    )
+    if (needs_total_recovery or needs_vendor_recovery) and ordered_pairs:
+        logger.info(
+            "Multi-segment fast path: targeted recovery triggered (needs_total=%s, needs_vendor=%s)",
+            needs_total_recovery, needs_vendor_recovery,
         )
+        t0_rec = time.perf_counter()
+        recovery_tasks = []
+        if needs_total_recovery:
+            # Bottom 35% of the last segment (where total/subtotal resides)
+            last_img, _ = ordered_pairs[-1]
+            recovery_tasks.append(
+                loop.run_in_executor(ocr_executor, read_region_recovery, last_img, 0.65, 1.0, "eng")
+            )
+        if needs_vendor_recovery:
+            # Top 30% of the first segment (where vendor/TIN resides)
+            first_img, _ = ordered_pairs[0]
+            recovery_tasks.append(
+                loop.run_in_executor(ocr_executor, read_region_recovery, first_img, 0.0, 0.30, "eng")
+            )
+
+        recovery_results = await asyncio.gather(*recovery_tasks, return_exceptions=True)
+        metrics["engine"] += time.perf_counter() - t0_rec
+
+        recovered_readings: list[OcrReading] = []
+        for res in recovery_results:
+            if isinstance(res, Exception):
+                logger.warning("Region recovery failed: %s", res)
+            elif isinstance(res, list):
+                recovered_readings.extend(res)
+            elif isinstance(res, OcrReading):
+                recovered_readings.append(res)
+
+        if recovered_readings:
+            merged_bundle.supporting.extend(recovered_readings)
+            merged_bundle.all_readings.extend(recovered_readings)
+            merged_bundle.early_exit = False
+            logger.info("Added %d recovered reading(s) to merged bundle", len(recovered_readings))
 
     # 6. Extract with assists on merged bundle
     t0_llm = time.perf_counter()
