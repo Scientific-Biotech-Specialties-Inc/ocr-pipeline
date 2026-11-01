@@ -95,11 +95,11 @@ Interactive OpenAPI docs (stack must be running): http://localhost:8010/docs
 Each `process_receipt_task` Celery job runs these stages in order:
 
 1. **Download & Ingest** — fetch file from `file_url` or parallel `file_urls` (multi-segment receipts up to 6); 3-zone blur verification for tall receipts
-2. **Pre-process & Strip Tiling** — OpenCV (grayscale, deskew, adaptive thresholding, denoising); tall single-image receipts (`height >= 1800` & `aspect >= 2.8`) automatically sliced into overlapping strips
-3. **OCR & Seam Stitching** — PaddleOCR extracts primary text & geometry on upright images; single-pass OpenCV + Tesseract serves as escalation fallback; middle item segments complete via density-aware fast path; multi-segment/strip texts merged via seam deduplication and coordinate translation; text quality scored (`app/core/textquality.py`)
-4. **LLM extraction** — Ollama `qwen3:1.7b` (non-thinking JSON mode, `num_ctx=2048`) parses vendor, location, tax basis, currency, and subtotal verification (prompt bounded to top/bottom contexts on long receipts)
+2. **Pre-process & Strip Tiling** — OpenCV (grayscale, deskew, adaptive thresholding, denoising); tall single-image receipts and tall `file_urls` segments (`height >= 1800` & `aspect >= 2.8`) automatically sliced into overlapping strips (capped at 10 strips)
+3. **OCR & Seam Stitching** — PaddleOCR extracts primary text & geometry on upright images; single-pass OpenCV + Tesseract serves as fallback; middle item segments complete via density-aware fast path; multi-segment/strip texts merged via 30-line seam deduplication, 7-digit barcode matching, and margin-guarded auto-ordering; unified anchors scored; targeted CLAHE crop recovery on header/footer if fields missing
+4. **LLM extraction** — Ollama `qwen3:1.7b` (non-thinking JSON mode, `num_ctx=2048`, integer `keep_alive`) parses vendor, location, tax basis, currency, and subtotal verification (prompt bounded to 2000 head + 2000 tail characters)
 5. **BIR validation** — `app/core/bir_validator.py` validates TIN format, VAT classification
-6. **Confidence scoring & Reconciliation** — `app/core/confidence.py` computes composite score (≥ 0.75 = acceptable); receipts (≥ 3 items) near-reconciled within 3% emit line items with score capped at 0.79 (`REASON_NEAR_RECONCILED`)
+6. **Confidence scoring & Reconciliation** — `app/core/confidence.py` computes composite score (≥ 0.75 = acceptable); receipts (≥ 3 items) near-reconciled within 3% or lacking total target emit line items with score capped at 0.79 (`REASON_NEAR_RECONCILED`), and `needs_manual_review` is always surfaced on the callback payload
 7. **Anomaly risk scoring** — `RandomForestClassifier` assigns a risk score (0.0–1.0) and category (`Low` / `Medium` / `High Risk`)
 8. **Embedding** — `all-MiniLM-L6-v2` generates a 384-dim vector from compacted receipt text; stored in PostgreSQL (`receipt_embeddings`)
 9. **Duplicate detection** — cosine similarity search within a 90-day window; threshold `0.85`

@@ -1,7 +1,10 @@
 """Offline financial-semantics and safe arithmetic coverage."""
 
 from app.api.schemas.ocr import OcrCallbackPayload, OcrProcessRequest
-from app.core.financial_semantics import normalize_iso_currency, validate_financial_semantics
+from app.core.financial_semantics import (
+    normalize_iso_currency,
+    validate_financial_semantics,
+)
 from app.core.layout import LabeledAmount, LayoutScan
 from app.core.locale import LocaleGuess, resolve_locale
 from app.core.reconcile import resolve_money
@@ -127,15 +130,17 @@ async def test_ollama_verify_subtotal_is_fail_soft(monkeypatch):
 
 
 def test_bound_context_short_text_unchanged():
-    from app.llm.ollama_provider import _bound_context, CONTEXT_HEAD_CHARS, CONTEXT_TAIL_CHARS
+    from app.llm.ollama_provider import (
+        _bound_context,
+    )
     short = "Vendor\nTotal 123.45"
     assert _bound_context(short) == short
 
 
 def test_bound_context_keeps_header_and_tail():
-    from app.llm.ollama_provider import _bound_context, CONTEXT_HEAD_CHARS
+    from app.llm.ollama_provider import _bound_context
     body = "line\n" * 3000
-    text = "VENDOR HEADER %s FOOTER 99.95" % body
+    text = f"VENDOR HEADER {body} FOOTER 99.95"
     bounded = _bound_context(text)
     assert "VENDOR HEADER" in bounded
     assert "FOOTER 99.95" in bounded
@@ -169,4 +174,35 @@ def test_semantics_evidence_grounding_normalizes_whitespace():
     assert sem is not None
     assert sem.tax_basis == "inclusive"
     assert sem.currency == "PHP"
+
+
+@pytest.mark.asyncio
+async def test_ollama_keep_alive_int_conversion(monkeypatch):
+    import httpx
+
+    from app.config import settings
+    from app.llm.ollama_provider import OllamaProvider
+
+    provider = OllamaProvider()
+    captured_payload = {}
+
+    class DummyResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"response": '{"test": 1}'}
+
+    async def fake_post(self, url, json=None, timeout=120.0):
+        captured_payload.update(json)
+        return DummyResponse()
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+    monkeypatch.setattr(settings, "ollama_keep_alive", "-1")
+
+    res = await provider._generate("test prompt", 64)
+    assert res == {"test": 1}
+    assert captured_payload.get("keep_alive") == -1
+    assert isinstance(captured_payload.get("keep_alive"), int)
+
 

@@ -11,6 +11,7 @@ import asyncio
 import logging
 import os
 import re
+import threading
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -21,7 +22,11 @@ import pytesseract
 from PIL import Image
 
 from app.core.anchors import AnchorScore, score_text
-from app.core.preprocessing import correct_orientation, preprocess_image
+from app.core.preprocessing import (
+    correct_orientation,
+    prepare_region_crop,
+    preprocess_image,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +40,7 @@ except Exception as exc:  # pragma: no cover - depends on the runtime image # no
 
 paddle_ocr = None
 _paddle_init_attempted = False
+_paddle_lock = threading.RLock()
 
 # Global Thread Pool Executor for CPU-bound OCR and preprocessing tasks.
 # Capped to avoid resource starvation under concurrent celery jobs.
@@ -47,26 +53,29 @@ def _get_paddle_ocr():
     global _paddle_init_attempted, paddle_ocr
     if paddle_ocr is not None:
         return paddle_ocr
-    if _paddle_init_attempted:
-        return None
-    _paddle_init_attempted = True
-    if PaddleOCR is None:
-        return None
-    try:
+    with _paddle_lock:
+        if paddle_ocr is not None:
+            return paddle_ocr
+        if _paddle_init_attempted:
+            return None
+        _paddle_init_attempted = True
+        if PaddleOCR is None:
+            return None
         try:
-            paddle_ocr = PaddleOCR(
-                lang="en",
-                use_doc_orientation_classify=False,
-                use_doc_unwarping=False,
-                use_textline_orientation=False,
-                enable_mkldnn=False,
-            )
-        except (TypeError, ValueError):
-            # PaddleOCR 2.x does not know the 3.x pipeline options.
-            paddle_ocr = PaddleOCR(use_angle_cls=True, lang="en")
-    except Exception as exc:  # pragma: no cover - depends on runtime/model # noqa: BLE001
-        logger.warning("PaddleOCR initialization failed; using Tesseract fallback: %s", exc)
-    return paddle_ocr
+            try:
+                paddle_ocr = PaddleOCR(
+                    lang="en",
+                    use_doc_orientation_classify=False,
+                    use_doc_unwarping=False,
+                    use_textline_orientation=False,
+                    enable_mkldnn=False,
+                )
+            except (TypeError, ValueError):
+                # PaddleOCR 2.x does not know the 3.x pipeline options.
+                paddle_ocr = PaddleOCR(use_angle_cls=True, lang="en")
+        except Exception as exc:  # pragma: no cover - depends on runtime/model # noqa: BLE001
+            logger.warning("PaddleOCR initialization failed; using Tesseract fallback: %s", exc)
+        return paddle_ocr
 
 
 # Fast-path eligibility and fallback settings.
@@ -339,48 +348,49 @@ def read_paddle(image: Image.Image) -> OcrReading:
     width, height = upright.size
     det_limit = 512 if height >= 2.0 * width else None
 
-    if hasattr(engine, "predict"):
-        # PaddleOCR 3.x returns OCRResult mappings. Disabling optional document
-        # stages avoids the CPU PIR/oneDNN path that is not supported by all
-        # Paddle runtime builds and is unnecessary for receipt crops.
-        kwargs = {
-            "use_doc_orientation_classify": False,
-            "use_doc_unwarping": False,
-            "use_textline_orientation": False,
-            "return_word_box": True,
-        }
-        if det_limit is not None:
-            kwargs["text_det_limit_side_len"] = det_limit
-        result = engine.predict(img_array, **kwargs)
-        first = result[0] if result else None
-        if first is not None and hasattr(first, "get"):
-            texts = first.get("rec_texts", [])
-            scores = first.get("rec_scores", [])
-            boxes = first.get("rec_boxes", [])
-            word_texts = first.get("text_word", [])
-            word_boxes = first.get("text_word_boxes", [])
-            for idx, text in enumerate(texts):
-                if idx >= len(boxes):
+    with _paddle_lock:
+        if hasattr(engine, "predict"):
+            # PaddleOCR 3.x returns OCRResult mappings. Disabling optional document
+            # stages avoids the CPU PIR/oneDNN path that is not supported by all
+            # Paddle runtime builds and is unnecessary for receipt crops.
+            kwargs = {
+                "use_doc_orientation_classify": False,
+                "use_doc_unwarping": False,
+                "use_textline_orientation": False,
+                "return_word_box": True,
+            }
+            if det_limit is not None:
+                kwargs["text_det_limit_side_len"] = det_limit
+            result = engine.predict(img_array, **kwargs)
+            first = result[0] if result else None
+            if first is not None and hasattr(first, "get"):
+                texts = first.get("rec_texts", [])
+                scores = first.get("rec_scores", [])
+                boxes = first.get("rec_boxes", [])
+                word_texts = first.get("text_word", [])
+                word_boxes = first.get("text_word_boxes", [])
+                for idx, text in enumerate(texts):
+                    if idx >= len(boxes):
+                        continue
+                    score = scores[idx] if idx < len(scores) else 0.0
+                    line_words = word_texts[idx] if idx < len(word_texts) else None
+                    line_boxes = word_boxes[idx] if idx < len(word_boxes) else None
+                    _append_paddle_line(
+                        words, text, score, boxes[idx], idx, line_words, line_boxes
+                    )
+                    confidences.append(max(0.0, min(float(score), 1.0)))
+        else:
+            # PaddleOCR 2.x returns ``[[[polygon, (text, confidence)], ...]]``.
+            img_bgr = img_array[:, :, ::-1]
+            result = engine.ocr(img_bgr, cls=True)
+            for idx, line in enumerate(result[0] if result and result[0] else []):
+                try:
+                    box, (text, confidence) = line
+                except (TypeError, ValueError):
+                    logger.warning("PaddleOCR returned an unsupported line shape")
                     continue
-                score = scores[idx] if idx < len(scores) else 0.0
-                line_words = word_texts[idx] if idx < len(word_texts) else None
-                line_boxes = word_boxes[idx] if idx < len(word_boxes) else None
-                _append_paddle_line(
-                    words, text, score, boxes[idx], idx, line_words, line_boxes
-                )
-                confidences.append(max(0.0, min(float(score), 1.0)))
-    else:
-        # PaddleOCR 2.x returns ``[[[polygon, (text, confidence)], ...]]``.
-        img_bgr = img_array[:, :, ::-1]
-        result = engine.ocr(img_bgr, cls=True)
-        for idx, line in enumerate(result[0] if result and result[0] else []):
-            try:
-                box, (text, confidence) = line
-            except (TypeError, ValueError):
-                logger.warning("PaddleOCR returned an unsupported line shape")
-                continue
-            _append_paddle_line(words, text, confidence, box, idx)
-            confidences.append(max(0.0, min(float(confidence), 1.0)))
+                _append_paddle_line(words, text, confidence, box, idx)
+                confidences.append(max(0.0, min(float(confidence), 1.0)))
 
     if not words:
         # A successful model call with no detections is not successful OCR. Let
@@ -468,6 +478,94 @@ def read_fast(image: Image.Image, lang: str = "eng") -> OcrReading:
         except AttributeError:
             pass
     return reading
+
+
+def read_segment_fast(image: Image.Image, lang: str = "eng") -> OcrReading:
+    """Run PaddleOCR on a segment/strip, falling back to Tesseract only if Paddle fails or yields < 2 lines."""
+    try:
+        reading = read_paddle(image)
+        if len(reading.lines) >= 2:
+            return reading
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("PaddleOCR failed on segment; falling back to Tesseract: %s", exc)
+    return read_fast(image, lang=lang)
+
+
+def read_region_recovery(
+    image: Image.Image,
+    y_start_ratio: float,
+    y_end_ratio: float,
+    lang: str = "eng",
+) -> list[OcrReading]:
+    """Targeted high-contrast crop recovery for missing header (TIN/vendor) or footer (total/subtotal)."""
+    crop, y_offset = prepare_region_crop(image, y_start_ratio, y_end_ratio)
+    candidates: list[OcrReading] = []
+
+    # 1. PaddleOCR on contrast-enhanced crop (crop has small aspect ratio, no 512 resize penalty)
+    try:
+        r_paddle = read_paddle(crop)
+        shifted_words = [
+            Word(
+                text=w.text,
+                confidence=w.confidence,
+                left=w.left,
+                top=w.top + y_offset,
+                width=w.width,
+                height=w.height,
+                block=w.block,
+                par=w.par,
+                line=w.line,
+            )
+            for w in r_paddle.words
+        ]
+        r_paddle_shifted = OcrReading(
+            text=r_paddle.text,
+            words=shifted_words,
+            confidence=r_paddle.confidence,
+            variant="region_paddle",
+            psm=0,
+            engine="paddle",
+            lines=group_lines(shifted_words),
+        )
+        r_paddle_shifted.anchors = r_paddle.anchors
+        candidates.append(r_paddle_shifted)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Paddle recovery on region [%.2f, %.2f] failed: %s", y_start_ratio, y_end_ratio, exc)
+
+    # 2. Tesseract single-pass at PSM 6 on the CLAHE crop
+    try:
+        r_tess = read_variant(crop, psm=6, lang=lang)
+        if r_tess.words:
+            shifted_words_tess = [
+                Word(
+                    text=w.text,
+                    confidence=w.confidence,
+                    left=w.left,
+                    top=w.top + y_offset,
+                    width=w.width,
+                    height=w.height,
+                    block=w.block,
+                    par=w.par,
+                    line=w.line,
+                )
+                for w in r_tess.words
+            ]
+            r_tess_shifted = OcrReading(
+                text=r_tess.text,
+                words=shifted_words_tess,
+                confidence=r_tess.confidence,
+                variant="region_tess",
+                psm=6,
+                engine="tesseract",
+                lines=group_lines(shifted_words_tess),
+            )
+            r_tess_shifted.anchors = r_tess.anchors
+            candidates.append(r_tess_shifted)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Tesseract recovery on region [%.2f, %.2f] failed: %s", y_start_ratio, y_end_ratio, exc)
+
+    return candidates
+
 
 
 _ITEM_ROW_DENSITY_RE = re.compile(

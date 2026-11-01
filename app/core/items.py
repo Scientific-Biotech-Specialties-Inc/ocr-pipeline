@@ -481,7 +481,12 @@ def reconcile_items(
         name: value for name, value in targets.items() if value is not None
     }
     if not candidates:
+        scan.price_basis = "none"
+        scan.total = line_total
         scan.notes.append("no subtotal available to check items against")
+        if len(items) >= 3:
+            scan.near_reconciled = True
+            scan.notes.append(f"{len(items)} items emitted without total target -> needs manual review")
         return scan
 
     # Prefer the line-total reading: it needs no assumption about the receipt's

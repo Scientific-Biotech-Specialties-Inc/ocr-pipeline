@@ -264,3 +264,35 @@ def preprocess_image(image: Image.Image) -> Image.Image:
 
     return result
 
+
+def prepare_region_crop(
+    image: Image.Image,
+    y_start_ratio: float,
+    y_end_ratio: float,
+) -> tuple[Image.Image, int]:
+    """Crop a vertical region of an upright receipt image and enhance contrast for faded text.
+
+    Used for targeted recovery of headers (vendor/TIN) or footers (total/subtotal).
+    Returns (preprocessed_crop_image, y_offset_px).
+    """
+    upright = correct_orientation(image)
+    w, h = upright.size
+    y_start = max(0, int(h * y_start_ratio))
+    y_end = min(h, int(h * y_end_ratio))
+    if y_end <= y_start:
+        y_end = min(h, y_start + 100)
+
+    cropped = upright.crop((0, y_start, w, y_end))
+    gray = to_gray(cropped)
+    crop_h, crop_w = gray.shape[:2]
+    if crop_w < 800 and crop_h > 0:
+        factor = min(800.0 / crop_w, 2.0)
+        gray = cv2.resize(gray, None, fx=factor, fy=factor, interpolation=cv2.INTER_CUBIC)
+
+    flattened = remove_shadow(gray)
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    enhanced = clahe.apply(flattened)
+    cleaned = denoise(enhanced)
+    return Image.fromarray(cleaned), y_start
+
+

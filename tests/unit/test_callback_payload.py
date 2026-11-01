@@ -8,7 +8,9 @@ import pytest
 from pydantic import ValidationError
 
 from app.api.schemas.ocr import (
-    OcrCallbackPayload, ReceiptItem, build_callback_payload,
+    OcrCallbackPayload,
+    ReceiptItem,
+    build_callback_payload,
 )
 
 FIELDS = {
@@ -189,5 +191,31 @@ class TestQualityRejection:
         )
         bundle_receipt = OcrBundle(primary=reading_receipt, supporting=[], all_readings=[reading_receipt])
         assert is_likely_receipt(bundle_receipt, extraction) is True
+
+        # Anchors is None on primary reading, but text has money tokens
+        reading_none_anchors = OcrReading(
+            text="Item description\n1 x 46.25 46.25 V\nItem two 14.75",
+            words=[],
+            confidence=0.9,
+            variant="raw",
+            psm=6,
+            anchors=None,
+        )
+        bundle_none_anchors = OcrBundle(
+            primary=reading_none_anchors, supporting=[], all_readings=[reading_none_anchors]
+        )
+        assert is_likely_receipt(bundle_none_anchors, extraction) is True
+
+        # Parsed item_scan with >= 2 items
+        from app.core.items import ExtractedItem, ItemScan
+        item_scan = ItemScan(
+            items=[
+                ExtractedItem(name="Product A", quantity=1, price=10.0),
+                ExtractedItem(name="Product B", quantity=1, price=20.0),
+            ]
+        )
+        extraction_with_items = Extraction(fields={}, item_scan=item_scan)
+        assert is_likely_receipt(bundle, extraction_with_items) is True
+
 
 

@@ -200,3 +200,64 @@ def test_split_tall_image_into_strips():
     for s in strips:
         assert getattr(s, "_is_virtual_strip", False) is True
         assert hasattr(s, "_virtual_y_offset")
+
+
+def test_merge_segment_readings_populates_anchors():
+    img1 = Image.new("RGB", (450, 400))
+    img2 = Image.new("RGB", (450, 400))
+
+    r1 = _make_reading([
+        "Store Name",
+        "1 x 100.00 100.00",
+        "1 x 50.00 50.00",
+    ])
+    r2 = _make_reading([
+        "1 x 50.00 50.00",
+        "1 x 25.00 25.00",
+        "Total 175.00",
+    ])
+
+    merged_reading, _ = merge_segment_readings([(img1, r1), (img2, r2)])
+    assert merged_reading.anchors is not None
+    assert merged_reading.anchors.money_tokens >= 3
+    assert merged_reading.score > 0.0
+
+
+def test_order_segments_margin_guard_preserves_caller_order():
+    """When segments have ambiguous middle items without clear header/footer or strong seam, keep caller order."""
+    img1 = Image.new("RGB", (450, 400))
+    img2 = Image.new("RGB", (450, 400))
+    img3 = Image.new("RGB", (450, 400))
+
+    r1 = _make_reading(["Item 1 10.00", "Item 2 20.00"])
+    r2 = _make_reading(["Item 3 30.00", "Item 4 40.00"])
+    r3 = _make_reading(["Item 5 50.00", "Item 6 60.00"])
+
+    caller_segments = [(img1, r1), (img2, r2), (img3, r3)]
+    ordered = order_segments(caller_segments)
+
+    # Margin guard ensures caller order is not arbitrarily scrambled
+    assert [r for _, r in ordered] == [r1, r2, r3]
+
+
+def test_merge_segment_readings_partial_barcode_overlap():
+    img1 = Image.new("RGB", (450, 400))
+    img2 = Image.new("RGB", (450, 400))
+
+    # Segment 1 has barcode 4800011812047, segment 2 has 11812047 (common 7-digit suffix)
+    r1 = _make_reading([
+        "4800011812047 SUPEHO G/BHON 500G",
+        "1 x 46.25 46.25 V",
+    ])
+    r2 = _make_reading([
+        "11812047 SUPEHO G/BHON 500G",
+        "1 x 46.25 46.25 V",
+        "4800024588963 DM CC S/S P/P900G",
+    ])
+
+    merged_reading, gap = merge_segment_readings([(img1, r1), (img2, r2)])
+    assert gap is False
+    merged_lines = [ln for ln in merged_reading.text.splitlines() if ln.strip()]
+    supeho_count = sum(1 for ln in merged_lines if "SUPEHO" in ln)
+    assert supeho_count == 1
+

@@ -33,8 +33,8 @@ EXTRACTION_TOKEN_LIMIT = 768
 # receipt header, totals and tax wording in the footer. Feeding a long run-on body
 # just taxes CPU prefill and stalls. Bound context to the header + a fixed tail so
 # the model sees the relevant regions without the full itemized middle.
-CONTEXT_HEAD_CHARS = 3500
-CONTEXT_TAIL_CHARS = 2500
+CONTEXT_HEAD_CHARS = 2000
+CONTEXT_TAIL_CHARS = 2000
 
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
@@ -66,13 +66,19 @@ class OllamaProvider(LLMProvider):
         ``json.loads`` raise straight through into a failed callback, losing an
         otherwise good extraction.
         """
+        keep_alive = settings.ollama_keep_alive
+        if isinstance(keep_alive, str):
+            clean_ka = keep_alive.strip()
+            if clean_ka.lstrip("-").isdigit():
+                keep_alive = int(clean_ka)
+
         payload = {
             "model": self.model,
             "prompt": prompt,
             "stream": False,
             "think": False,
             "format": "json",
-            "keep_alive": settings.ollama_keep_alive,
+            "keep_alive": keep_alive,
             "options": {
                 "temperature": 0.0,
                 "top_p": 1.0,
@@ -113,7 +119,7 @@ class OllamaProvider(LLMProvider):
                 raise
             parsed = json.loads(text[start:end + 1])
         if not isinstance(parsed, dict):
-            raise ValueError(f"Expected a JSON object, got {type(parsed).__name__}")
+            raise TypeError(f"Expected a JSON object, got {type(parsed).__name__}")
         return parsed
 
     async def extract_receipt_fields(self, ocr_text: str) -> dict:
