@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from app.core.ocr_engine import Word
 from app.core.textquality import looks_like_words
@@ -147,15 +147,15 @@ def select_vendor_tax_id(candidates: list[TaxIdCandidate]) -> TaxIdCandidate | N
 # ---------------------------------------------------------------------------
 
 DATE_PATTERNS_MONTH_FIRST: tuple[tuple[str, tuple[str, ...]], ...] = (
-    (r"\b(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})\b", ("%Y", "%m", "%d")),
-    (r"\b(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})\b", ("%m", "%d", "%Y")),
-    (r"\b(\d{1,2})[-/.](\d{1,2})[-/.](\d{2})\b", ("%m", "%d", "%y")),
+    (r"(?<!\d)(\d{4})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*(\d{1,2})(?!\d)", ("%Y", "%m", "%d")),
+    (r"(?<!\d)(\d{1,2})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*['’]?(\d{4})(?!\d)", ("%m", "%d", "%Y")),
+    (r"(?<!\d)(\d{1,2})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*['’]?(\d{2})(?!\d)", ("%m", "%d", "%y")),
 )
 
 DATE_PATTERNS_DAY_FIRST: tuple[tuple[str, tuple[str, ...]], ...] = (
-    (r"\b(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})\b", ("%Y", "%m", "%d")),
-    (r"\b(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})\b", ("%d", "%m", "%Y")),
-    (r"\b(\d{1,2})[-/.](\d{1,2})[-/.](\d{2})\b", ("%d", "%m", "%y")),
+    (r"(?<!\d)(\d{4})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*(\d{1,2})(?!\d)", ("%Y", "%m", "%d")),
+    (r"(?<!\d)(\d{1,2})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*['’]?(\d{4})(?!\d)", ("%d", "%m", "%Y")),
+    (r"(?<!\d)(\d{1,2})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*['’]?(\d{2})(?!\d)", ("%d", "%m", "%y")),
 )
 
 # Countries that write the month first. Everywhere else, '05/03/2024' is 5 March,
@@ -164,11 +164,23 @@ DATE_PATTERNS_DAY_FIRST: tuple[tuple[str, tuple[str, ...]], ...] = (
 MONTH_FIRST_COUNTRIES = frozenset({"US", "PH"})
 
 MONTH_NAME_RE = re.compile(
-    r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?\s*,?\s*(\d{4})\b",
+    r"(?<![A-Za-z0-9])"
+    r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?"
+    r"[\s\-_/]+"
+    r"(\d{1,2})(?:st|nd|rd|th)?"
+    r"(?:,\s*|[\s\-_/]+)"
+    r"['’]?(\d{2,4})"
+    r"(?!\d)",
     re.IGNORECASE,
 )
 DAY_MONTH_NAME_RE = re.compile(
-    r"\b(\d{1,2})(?:st|nd|rd|th)?\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{2,4})\b",
+    r"(?<!\d)"
+    r"(\d{1,2})(?:st|nd|rd|th)?"
+    r"(?:[\s\-_/]+|[\s\-_/]+of[\s\-_/]+)"
+    r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?"
+    r"(?:,\s*|[\s\-_/]+)"
+    r"['’]?(\d{2,4})"
+    r"(?!\d)",
     re.IGNORECASE,
 )
 
@@ -180,14 +192,15 @@ _MONTH_NUM = {
 DATE_LABELS = (
     "date", "issued on", "transaction", "invoice date", "or date",
     "dt:", "dated", "txn date", "purchase date", "sale date",
-    "receipt date", "billing date",
+    "receipt date", "billing date", "trans. date", "trans date",
+    "order date", "sales date", "posting date", "entry date",
 )
 
 COMPACT_DATE_RE = re.compile(
-    r"\b(\d{4})(\d{2})(\d{2})\b|\b(\d{2})(\d{2})(\d{4})\b"
+    r"(?<!\d)(\d{4})(\d{2})(\d{2})(?!\d)|(?<!\d)(\d{2})(\d{2})(\d{4})(?!\d)"
 )
 SPACED_DATE_RE = re.compile(
-    r"\b(\d{4})\s+(\d{1,2})\s+(\d{1,2})\b|\b(\d{1,2})\s+(\d{1,2})\s+(\d{4})\b"
+    r"(?<!\d)(\d{4})\s+(\d{1,2})\s+(\d{1,2})(?!\d)|(?<!\d)(\d{1,2})\s+(\d{1,2})\s+(\d{4})(?!\d)"
 )
 
 # Dates in these contexts belong to the payment terminal or the print shop, not
@@ -204,7 +217,18 @@ DATE_NEGATIVE_CONTEXT = (
     # transaction date is labelled 'Date' or 'Date:', never 'Date/', so the slash
     # is a clean discriminator - and it is what separates receipt 1's real date
     # of 5/24/2025 from the card block's 11/20/2019.
-    "date/",
+    "date/", "ptu",
+)
+
+_OCR_CHAR_MAP = str.maketrans({
+    "O": "0", "o": "0",
+    "I": "1", "l": "1", "|": "1",
+    "S": "5", "s": "5",
+    "B": "8",
+})
+
+_OCR_NOISY_DATE_RE = re.compile(
+    r"(?<![A-Za-z0-9])([0-9OolI|SsB]{1,4})\s*([-/.]|[\s])\s*([0-9OolI|SsB]{1,2})\s*(\2)\s*([0-9OolI|SsB]{2,4})(?![A-Za-z0-9])"
 )
 
 
@@ -215,6 +239,7 @@ class DateCandidate:
     line_index: int
     line_text: str
     score: float = 0.0
+    span: tuple[int, int] = (0, 0)
 
 
 def find_dates(
@@ -227,27 +252,57 @@ def find_dates(
     month on any date up to the 12th.
     """
     today = today or date.today()
+    max_date = today + timedelta(days=1)
     month_first = country is None or country.upper() in MONTH_FIRST_COUNTRIES
     candidates: list[DateCandidate] = []
 
     for index, line_text in enumerate(lines):
         lowered = line_text.casefold()
         has_label = any(label in lowered for label in DATE_LABELS)
-        for parsed, raw in _parse_line_dates(line_text, month_first=month_first, has_date_label=has_label):
-            if not (date(1990, 1, 1) <= parsed <= today):
+        for parsed, raw, span in _parse_line_dates(line_text, month_first=month_first, has_date_label=has_label):
+            if not (date(1990, 1, 1) <= parsed <= max_date):
                 continue  # reject impossible / future transaction dates
             candidates.append(
                 DateCandidate(value=parsed, raw=raw, line_index=index,
-                              line_text=line_text)
+                              line_text=line_text, span=span)
             )
 
     total = max(len(lines), 1)
+    time_re = re.compile(r"\b\d{1,2}:\d{2}(?::\d{2})?\s*(?:am|pm)?\b", re.IGNORECASE)
+
     for candidate in candidates:
         lowered = candidate.line_text.casefold()
-        if any(label in lowered for label in DATE_LABELS):
+        cand_start, cand_end = candidate.span
+        pre_text = lowered[:cand_start]
+        post_text = lowered[cand_end:]
+
+        # 1. Date label scoring (proximity-aware)
+        has_pre_label = any(label in pre_text[-30:] for label in DATE_LABELS)
+        prev_has_label = False
+        if candidate.line_index > 0:
+            prev_line = lines[candidate.line_index - 1].casefold()
+            prev_has_label = any(label in prev_line for label in DATE_LABELS)
+
+        if has_pre_label:
             candidate.score += 2.0
-        if any(bad in lowered for bad in DATE_NEGATIVE_CONTEXT):
+        elif any(label in lowered for label in DATE_LABELS) or prev_has_label:
+            candidate.score += 1.5
+
+        # 2. Adjacent timestamp boost (+1.0)
+        has_time_near = bool(
+            time_re.search(pre_text[-30:]) or time_re.search(post_text[:30])
+        )
+        if has_time_near:
+            candidate.score += 1.0
+
+        # 3. Negative context penalty
+        has_pre_negative = any(bad in pre_text[-35:] for bad in DATE_NEGATIVE_CONTEXT)
+        has_post_negative = not has_time_near and any(bad in post_text[:15] for bad in ("expiry", "expires", "valid until"))
+        is_atp_block = any(bad in lowered for bad in ("atp", "accreditation", "printer", "permit", "booklets", "bklts", "ptu")) and not has_time_near
+
+        if has_pre_negative or has_post_negative or is_atp_block:
             candidate.score -= 5.0
+
         # Transaction dates appear near the top of a receipt.
         candidate.score += 1.5 * (1.0 - candidate.line_index / total)
         # Prefer recent transaction dates over OCR year digit corruptions (e.g. 2025 vs 2005)
@@ -262,7 +317,7 @@ def find_dates(
         by_value.setdefault(c.value, []).append(c)
 
     best_candidates: list[DateCandidate] = []
-    for date_val, group in by_value.items():
+    for group in by_value.values():
         top = max(group, key=lambda c: c.score)
         if len(group) > 1:
             top.score += 0.5 * min(len(group) - 1, 3)
@@ -273,32 +328,50 @@ def find_dates(
 
 def _parse_line_dates(
     line_text: str, month_first: bool = True, has_date_label: bool = False
-) -> list[tuple[date, str]]:
-    found: list[tuple[date, str]] = []
+) -> list[tuple[date, str, tuple[int, int]]]:
+    found: list[tuple[date, str, tuple[int, int]]] = []
+    seen_spans: set[tuple[int, int]] = set()
 
+    def _add_found(dt: date | None, raw: str, span: tuple[int, int]) -> None:
+        if dt is None:
+            return
+        if span in seen_spans:
+            return
+        start, end = span
+        if any(s <= start and end <= e for s, e in seen_spans):
+            return
+        seen_spans.add(span)
+        found.append((dt, raw, span))
+
+    # 1. Textual Month Formats
     for match in MONTH_NAME_RE.finditer(line_text):
         month = _MONTH_NUM[match.group(1)[:3].lower()]
-        found.append(
-            (_safe_date(int(match.group(3)), month, int(match.group(2))), match.group(0))
-        )
+        year = int(match.group(3))
+        if year < 100:
+            year += 2000 if year < 50 else 1900
+        _add_found(_safe_date(year, month, int(match.group(2))), match.group(0), match.span())
+
     for match in DAY_MONTH_NAME_RE.finditer(line_text):
         month = _MONTH_NUM[match.group(2)[:3].lower()]
         year = int(match.group(3))
-        year += 2000 if year < 100 else 0
-        found.append((_safe_date(year, month, int(match.group(1))), match.group(0)))
+        if year < 100:
+            year += 2000 if year < 50 else 1900
+        _add_found(_safe_date(year, month, int(match.group(1))), match.group(0), match.span())
 
+    # 2. Standard Numeric Formats
     patterns = DATE_PATTERNS_MONTH_FIRST if month_first else DATE_PATTERNS_DAY_FIRST
     for pattern, order in patterns:
         for match in re.finditer(pattern, line_text):
             parts = dict(zip(order, match.groups()))
             year = int(parts.get("%Y") or parts.get("%y") or 0)
             if "%y" in parts and year < 100:
-                year += 2000
+                year += 2000 if year < 50 else 1900
             month, day = int(parts["%m"]), int(parts["%d"])
             if month > 12 and day <= 12:
                 month, day = day, month  # impossible month: the order was reversed
-            found.append((_safe_date(year, month, day), match.group(0)))
+            _add_found(_safe_date(year, month, day), match.group(0), match.span())
 
+    # 3. Compact & Spaced Formats (requires date label on line)
     if has_date_label:
         for match in COMPACT_DATE_RE.finditer(line_text):
             g = match.groups()
@@ -307,9 +380,9 @@ def _parse_line_dates(
             else:
                 y = int(g[5])
                 m, d = (int(g[3]), int(g[4])) if month_first else (int(g[4]), int(g[3]))
-            dt = _safe_date(y, m, d)
-            if dt:
-                found.append((dt, match.group(0)))
+                if m > 12 and d <= 12:
+                    m, d = d, m
+            _add_found(_safe_date(y, m, d), match.group(0), match.span())
 
         for match in SPACED_DATE_RE.finditer(line_text):
             g = match.groups()
@@ -318,11 +391,38 @@ def _parse_line_dates(
             else:
                 y = int(g[5])
                 m, d = (int(g[3]), int(g[4])) if month_first else (int(g[4]), int(g[3]))
-            dt = _safe_date(y, m, d)
-            if dt:
-                found.append((dt, match.group(0)))
+                if m > 12 and d <= 12:
+                    m, d = d, m
+            _add_found(_safe_date(y, m, d), match.group(0), match.span())
 
-    return [(value, raw) for value, raw in found if value is not None]
+    # 4. Scoped OCR noisy character normalization (e.g. O8/11/2026, 08/ll/2026, 2O26-07-30)
+    for match in _OCR_NOISY_DATE_RE.finditer(line_text):
+        if match.span() in seen_spans:
+            continue
+        g1, g3, g5 = match.group(1), match.group(3), match.group(5)
+        if not any(c in "OolI|SsB" for c in g1 + g3 + g5):
+            continue
+        p1 = g1.translate(_OCR_CHAR_MAP)
+        p2 = g3.translate(_OCR_CHAR_MAP)
+        p3 = g5.translate(_OCR_CHAR_MAP)
+        if not (p1.isdigit() and p2.isdigit() and p3.isdigit()):
+            continue
+
+        if len(p1) == 4 and len(p2) in (1, 2) and len(p3) in (1, 2):
+            y, m, d = int(p1), int(p2), int(p3)
+            if m > 12 and d <= 12:
+                m, d = d, m
+            _add_found(_safe_date(y, m, d), match.group(0), match.span())
+        elif len(p3) in (2, 4) and len(p1) in (1, 2) and len(p2) in (1, 2):
+            y = int(p3)
+            if y < 100:
+                y += 2000 if y < 50 else 1900
+            m, d = (int(p1), int(p2)) if month_first else (int(p2), int(p1))
+            if m > 12 and d <= 12:
+                m, d = d, m
+            _add_found(_safe_date(y, m, d), match.group(0), match.span())
+
+    return found
 
 
 def _safe_date(year: int, month: int, day: int) -> date | None:
