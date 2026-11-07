@@ -59,7 +59,19 @@ LABELS: dict[str, tuple[str, ...]] = {
         "add: vat", "sales tax", "output vat", "vat", "gst", "sst", "tax",
     ),
     "service_charge": ("service charge", "svc charge", "svc chg", "service chg"),
-    "discount_amount": ("less: discount", "less discount", "discount"),
+    "discount_amount": (
+        "less: senior citizen discount", "less: sc discount", "senior citizen discount",
+        "senior citizen disc", "senior discount", "senior disc", "20% sc discount",
+        "20% sc disc", "sc discount", "sc disc", "less: sc", "osca discount",
+        "less: pwd discount", "pwd discount", "pwd disc", "20% pwd discount",
+        "20% pwd disc", "less: pwd",
+        "less: student discount", "student discount", "student disc",
+        "less: employee discount", "employee discount", "employee disc", "staff discount",
+        "less: promo discount", "promo discount", "promo disc", "voucher discount",
+        "coupon discount", "member discount", "loyalty discount", "card savings",
+        "card saver", "annivdiscount", "anniv discount",
+        "less: discount", "less discount", "total discount", "discount", "disc",
+    ),
     "withholding_tax": ("less: withholding tax", "withholding tax", "ewt"),
 }
 
@@ -252,3 +264,39 @@ def _best_label(line_text: str) -> tuple[str, str] | None:
             if best is None or len(keyword) > len(best[1]):
                 best = (field_name, keyword)
     return best
+
+
+_DISCOUNT_TYPE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("senior", re.compile(r"\b(senior\s*citizen|senior|osca|sc\s*disc(?:ount)?|less\s*:?\s*sc)\b", re.IGNORECASE)),
+    ("pwd", re.compile(r"\b(pwd|person\s+with\s+disabilit\w*)\b", re.IGNORECASE)),
+    ("student", re.compile(r"\b(student)\b", re.IGNORECASE)),
+    ("employee", re.compile(r"\b(employee|staff|associate)\b", re.IGNORECASE)),
+    ("promo", re.compile(r"\b(promo|promotion|voucher|coupon|member|loyalty|card\s+sav\w*|anniv\w*|bundle|mfrcpn|cartwheel)\b", re.IGNORECASE)),
+)
+
+
+def classify_discount_type(
+    discount_amount: float | None,
+    discount_lines: list[str] | None = None,
+    full_text: str = "",
+) -> str | None:
+    """Classify the discount category from matched discount rows or full text.
+
+    Returns one of: ``senior``, ``pwd``, ``student``, ``promo``, ``employee``,
+    ``other``, or ``None`` when no positive discount is present.
+    """
+    if discount_amount is None or discount_amount <= 0:
+        return None
+
+    for line in (discount_lines or []):
+        for dtype, pattern in _DISCOUNT_TYPE_PATTERNS:
+            if pattern.search(line):
+                return dtype
+
+    if full_text:
+        for dtype, pattern in _DISCOUNT_TYPE_PATTERNS:
+            if pattern.search(full_text):
+                return dtype
+
+    return "other"
+

@@ -127,6 +127,8 @@ def verify(
         )
 
     _drop_unreconciled_money(result, reconciled)
+    if not result.fields.get("discount_amount"):
+        result.fields["discount_type"] = None
     _collect_reasons(
         result,
         ocr_text=ocr_text,

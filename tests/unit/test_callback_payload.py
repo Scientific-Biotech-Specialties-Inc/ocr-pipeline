@@ -218,4 +218,64 @@ class TestQualityRejection:
         assert is_likely_receipt(bundle, extraction_with_items) is True
 
 
+class TestDiscountHandling:
+    def test_discount_fields_transmitted_in_callback(self):
+        fields = {
+            **FIELDS,
+            "discount_amount": 100.0,
+            "discount_type": "senior",
+        }
+        payload = build_callback_payload(42, fields, confidence=0.92)
+        dumped = payload.model_dump()
+        assert dumped["discount_amount"] == 100.0
+        assert dumped["discount_type"] == "senior"
+
+    def test_unknown_discount_type_defaults_to_other_when_amount_positive(self):
+        fields = {
+            **FIELDS,
+            "discount_amount": 25.0,
+            "discount_type": None,
+        }
+        payload = build_callback_payload(42, fields, confidence=0.92)
+        assert payload.discount_amount == 25.0
+        assert payload.discount_type == "other"
+
+    def test_classify_discount_type_variants(self):
+        from app.core.layout import classify_discount_type
+
+        assert classify_discount_type(50.0, ["Less: 20% SC Discount -50.00"]) == "senior"
+        assert classify_discount_type(50.0, ["Less: PWD Disc 50.00"]) == "pwd"
+        assert classify_discount_type(30.0, ["Student Discount -30.00"]) == "student"
+        assert classify_discount_type(20.0, ["Promo Voucher -20.00"]) == "promo"
+        assert classify_discount_type(15.0, ["Staff Discount -15.00"]) == "employee"
+        assert classify_discount_type(10.0, ["Less: Discount 10.00"]) == "other"
+        assert classify_discount_type(None, ["Less: Discount 10.00"]) is None
+        assert classify_discount_type(0.0, ["Less: Discount 0.00"]) is None
+
+    def test_reconcile_money_with_discount(self):
+        from app.core.layout import LabeledAmount, LayoutScan
+        from app.core.locale import LocaleGuess
+        from app.core.reconcile import resolve_money
+
+        scan = LayoutScan(
+            amounts={
+                "total_sales": [
+                    LabeledAmount("total_sales", "total sales", "500.00", "Total Sales 500.00", 0.95)
+                ],
+                "discount_amount": [
+                    LabeledAmount("discount_amount", "senior discount", "-100.00", "Senior Discount -100.00", 0.95)
+                ],
+                "total_amount": [
+                    LabeledAmount("total_amount", "total amount due", "400.00", "Total Amount Due 400.00", 0.95)
+                ],
+            },
+            money_tokens=["500.00", "-100.00", "400.00"],
+        )
+        money = resolve_money(scan, LocaleGuess(country="PH", currency="PHP", score=1.0), vat_registered=True, tax_basis="inclusive")
+        assert money.get("discount_amount") == 100.0
+        assert money.get("total_amount") == 400.0
+        assert money.reconciled is True
+
+
+
 

@@ -35,6 +35,7 @@ FIELD_KINDS: dict[str, FieldKind] = {
     "total_sales": FieldKind.MONEY,
     "service_charge": FieldKind.MONEY,
     "discount_amount": FieldKind.MONEY,
+    "discount_type": FieldKind.EXACT,
     "withholding_tax": FieldKind.MONEY,
     "total_amount": FieldKind.MONEY,
     "vat_classification": FieldKind.EXACT,
@@ -47,6 +48,10 @@ MONEY_FIELDS: tuple[str, ...] = tuple(
     name for name, kind in FIELD_KINDS.items() if kind is FieldKind.MONEY
 )
 
+DISCOUNT_TYPES: tuple[str, ...] = (
+    "none", "senior", "pwd", "student", "promo", "employee", "other",
+)
+
 # Fields inferred from context or computed arithmetically rather than read off the
 # page. Asking whether they "appear in the OCR text" is meaningless, so they are
 # exempt from grounding and from recoverability measurement.
@@ -54,6 +59,7 @@ DERIVED_FIELDS: frozenset[str] = frozenset({
     "country", "currency", "vendor_tax_id_type", "tax_type", "tax_rate",
     "vat_classification", "expense_category", "tax_basis", "financial_reconciliation_status",
     "needs_manual_review", "reported_total", "computed_total", "total_discrepancy",
+    "discount_type",
 })
 
 # SERMS' canonical list, from ExpenseCategory::DEFAULT_NAMES. Anything outside it
@@ -70,5 +76,6 @@ CALLBACK_FIELDS: tuple[str, ...] = (
     "vendor_name", "transaction_date", "total_amount", "vat_amount", "tin",
     "invoice_number", "vat_classification", "currency", "expense_category", "items",
     "location", "tax_basis", "financial_reconciliation_status", "needs_manual_review",
+    "discount_amount", "discount_type",
 )
 
