@@ -11,7 +11,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.core.categorize import (
-    CategoryChoice, Embedder, Tiebreaker, classify_category,
+    CategoryChoice,
+    Embedder,
+    Tiebreaker,
+    classify_category,
 )
 from app.core.extractors import (
     DateCandidate,
@@ -25,15 +28,18 @@ from app.core.extractors import (
     select_vendor_tax_id,
     text_lines,
 )
+from app.core.financial_semantics import FinancialSemantics, infer_tax_basis
 from app.core.items import ItemScan, parse_items, reconcile_items
 from app.core.layout import LayoutScan, classify_discount_type, scan_layout
-from app.core.financial_semantics import FinancialSemantics, infer_tax_basis
 from app.core.locale import LocaleGuess, resolve_locale
 from app.core.ocr_engine import OcrBundle
 from app.core.reconcile import (
-    MoneyResult, classify_tax, resolve_money, resolve_tax_type,
+    MoneyResult,
+    classify_tax,
+    resolve_money,
+    resolve_tax_type,
 )
-from app.core.vendor import VendorChoice, select_vendor_name
+from app.core.vendor import VendorChoice, _closest_candidate, select_vendor_name
 
 
 @dataclass
@@ -63,7 +69,7 @@ class Extraction:
         return dict(self.fields)
 
 
-def fast_path_sufficient(extraction: "Extraction") -> bool:
+def fast_path_sufficient(extraction: Extraction) -> bool:
     """Can this receipt ship from the single-pass fast path?
 
     A fast-path result is only trusted when the money actually reconciles and a
@@ -134,11 +140,14 @@ def extract(
     invoice_number, invoice_line = find_invoice_number(pooled_lines)
     readings_conf = [_lines_with_confidence(reading) for reading in [bundle.primary, *bundle.supporting]]
     vendors = find_vendor_candidates(readings_conf)
-    address_candidates = find_address_candidates(readings_conf)
-
     vendor_choice = select_vendor_name(
         vendors.lines, vendors.customer_names,
         llm_choice=llm_vendor_choice, meta=vendors.meta,
+    )
+    address_candidates = find_address_candidates(
+        readings_conf,
+        vendor_name=vendor_choice.name,
+        customer_names=vendors.customer_names,
     )
     category = classify_category(
         vendor_choice.name,
@@ -148,9 +157,13 @@ def extract(
     )
 
     location = caller_location or None
-    if location is None and llm_location_choice and llm_location_choice in address_candidates:
-        location = llm_location_choice
-    elif location is None and address_candidates:
+    if location is None and llm_location_choice:
+        matched_loc = _closest_candidate(llm_location_choice, address_candidates)
+        if matched_loc:
+            location = matched_loc
+        elif llm_location_choice in address_candidates:
+            location = llm_location_choice
+    if location is None and address_candidates:
         location = address_candidates[0]
 
     extraction = Extraction(

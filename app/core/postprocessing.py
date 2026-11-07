@@ -10,14 +10,13 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from typing import Any
 
-from rapidfuzz import process, distance
+from rapidfuzz import distance, process
 
 from app.core.dictionaries import ALL_DICTIONARY_TERMS
 from app.core.extraction import Extraction
 from app.core.items import looks_like_store_code
-from app.core.ocr_engine import OcrBundle, Word
+from app.core.ocr_engine import OcrBundle
 from app.llm.factory import create_provider
 
 logger = logging.getLogger(__name__)
@@ -222,11 +221,6 @@ async def normalize_extraction(
         extraction.fields["vendor_name"] = corrected_vendor
         extraction.vendor_choice.name = corrected_vendor
 
-    location = extraction.fields.get("location")
-    if location and isinstance(location, str):
-        corrected_location = dict_corrector.correct_phrase(location, bundle)
-        extraction.fields["location"] = corrected_location
-        
     # 2. Hybrid corrections on line items
     if extraction.item_scan and extraction.item_scan.items:
         items_payload = extraction.item_scan.payload()

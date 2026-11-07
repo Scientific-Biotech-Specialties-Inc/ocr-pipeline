@@ -5,8 +5,12 @@ than invented, so a regression here means a receipt that used to work has broken
 """
 
 from app.core.extractors import (
-    find_address_candidates, find_dates, find_invoice_number, find_tax_ids,
-    format_tax_id, select_vendor_tax_id,
+    find_address_candidates,
+    find_dates,
+    find_invoice_number,
+    find_tax_ids,
+    format_tax_id,
+    select_vendor_tax_id,
 )
 
 
@@ -209,4 +213,104 @@ class TestAddressCandidates:
         candidates = find_address_candidates(line_sets)
         assert len(candidates) >= 1
         assert "Makati City" in candidates[0]
+
+    def test_multi_line_us_address_assembly(self):
+        line_sets = [[
+            ("Jollibee Las Vegas", 98.0),
+            ("3890 S Maryland Parkway Suite 137", 95.0),
+            ("Las Vegas NV 89119", 94.0),
+            ("(702) 893-3005", 90.0),
+            ("5/24/2025, 11:47:32 AM", 92.0),
+        ]]
+        candidates = find_address_candidates(line_sets, vendor_name="Jollibee Las Vegas")
+        assert len(candidates) >= 1
+        assert "3890 S Maryland Parkway Suite 137, Las Vegas NV 89119" in candidates[0]
+
+    def test_multi_line_ph_address_assembly(self):
+        line_sets = [[
+            ("YAMACHAN JAPANESE RESTAURANT", 98.0),
+            ("VAT Reg. TIN 303-124-202-00000", 95.0),
+            ("Unit 6-1 Makati Cinema Square, Fernando St.", 92.0),
+            ("Pio Del Pilar, Makati City", 91.0),
+            ("NCR, Fourth District, Philippines", 90.0),
+            ("SOLD TO:", 85.0),
+        ]]
+        candidates = find_address_candidates(line_sets, vendor_name="Yamachan Japanese Restaurant")
+        assert len(candidates) >= 1
+        assert "Makati Cinema Square" in candidates[0]
+        assert "Pio Del Pilar, Makati City" in candidates[0]
+
+    def test_suite_and_zip_plus_four(self):
+        line_sets = [[
+            ("DOLLAR TREE", 99.0),
+            ("Store# 156 (517) 993-0356", 90.0),
+            ("1941 W Grand River Ave.", 94.0),
+            ("Suite 101", 92.0),
+            ("Okemos MI 56252-5601", 93.0),
+        ]]
+        candidates = find_address_candidates(line_sets, vendor_name="Dollar Tree")
+        assert len(candidates) >= 1
+        assert "1941 W Grand River Ave." in candidates[0]
+        assert "Okemos MI 56252-5601" in candidates[0]
+
+    def test_city_state_short_address(self):
+        line_sets = [[
+            ("Dos Amigos Restaurant", 95.0),
+            ("New York, NY", 92.0),
+            ("SALE", 88.0),
+        ]]
+        candidates = find_address_candidates(line_sets, vendor_name="Dos Amigos Restaurant")
+        assert len(candidates) >= 1
+        assert candidates[0] == "New York, NY"
+
+    def test_customer_address_is_excluded(self):
+        line_sets = [[
+            ("YAMACHAN JAPANESE RESTAURANT", 98.0),
+            ("VAT Reg. TIN 303-124-202-00000", 95.0),
+            ("Unit 6-1 Makati Cinema Square, Fernando St., Pio Del Pilar, Makati City", 90.0),
+            ("SOLD TO:", 88.0),
+            ("Registered Name: Scientific Biotech Specialties, Inc.", 85.0),
+            ("Business Address: 6023 Sacred Heart cor. Kamagong Sts.", 80.0),
+            ("San Antonio, 1203 Makati City, Metro Manila, Philippines", 80.0),
+        ]]
+        candidates = find_address_candidates(
+            line_sets,
+            vendor_name="Yamachan Japanese Restaurant",
+            customer_names=["Scientific Biotech Specialties, Inc."],
+        )
+        assert len(candidates) >= 1
+        assert "Makati Cinema Square" in candidates[0]
+        assert all("6023 Sacred Heart" not in c for c in candidates)
+
+    def test_bir_printer_accreditation_is_excluded(self):
+        line_sets = [[
+            ("UNITED DAILY PRESS INC.", 98.0),
+            ("812 Benavidez Street Barangay 295 Binondo Manila", 92.0),
+            ("VAT Reg TIN: 008-666-750-000", 90.0),
+            ("LILEDAU PRINTERS Printers Accreditation No. 038MP20140000000045", 85.0),
+            ("58 Branches St. Sangandaan Q.C.", 80.0),
+        ]]
+        candidates = find_address_candidates(line_sets, vendor_name="United Daily Press Inc.")
+        assert len(candidates) >= 1
+        assert "812 Benavidez Street" in candidates[0]
+        assert all("Sangandaan" not in c for c in candidates)
+
+    def test_vendor_name_is_not_picked_as_address(self):
+        line_sets = [[
+            ("Jollibee Las Vegas", 98.0),
+            ("3890 S Maryland Parkway Suite 137", 95.0),
+            ("Las Vegas NV 89119", 94.0),
+        ]]
+        candidates = find_address_candidates(line_sets, vendor_name="Jollibee Las Vegas")
+        assert "Jollibee Las Vegas" not in candidates
+        assert any("3890 S Maryland Parkway" in c for c in candidates)
+
+    def test_inline_phone_is_stripped_from_address(self):
+        line_sets = [[
+            ("Highpointe Medical Hub, 2/F Shaw Blvd. cor. M. Yulo, Brgy. Bagong Silang, Mandaluyong City Tel. No.: 02-8-2564681", 90.0),
+        ]]
+        candidates = find_address_candidates(line_sets)
+        assert len(candidates) >= 1
+        assert "Mandaluyong City" in candidates[0]
+        assert "02-8-2564681" not in candidates[0]
 
