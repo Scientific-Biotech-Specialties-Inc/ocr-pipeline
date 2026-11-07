@@ -296,7 +296,7 @@ async def process_receipt(
             derived_fields=(
                 set(extraction.money.derived) if extraction.money else set()
             ) | {"tax_basis", "financial_reconciliation_status", "needs_manual_review",
-                 "reported_total", "computed_total", "total_discrepancy"}
+                 "reported_total", "computed_total", "total_discrepancy", "discount_type"}
             | ({"location"} if location else set()),
             near_reconciled=near_reconciled,
             segment_gap=gap_suspected,

@@ -108,6 +108,8 @@ Sent to the provided `callback_url`.
   "total_amount": 100.0,
   "subtotal": 90.0,
   "vat_amount": 10.0,
+  "discount_amount": 0.0,
+  "discount_type": "none",
   "tin": "...",
   "invoice_number": "...",
   "vat_classification": "vat",
@@ -123,6 +125,7 @@ Sent to the provided `callback_url`.
   ]
 }
 ```
+> **Note on `discount_type` & `discount_amount`:** `discount_type` is one of `none | senior | pwd | student | promo | employee | other` when a discount is detected (omitted when no discount is present). `discount_amount` is the positive total discount deducted from the gross receipt items/sales.
 > **Note on `items[].price`:** `price` is always emitted as the **line total** (extended amount for that item row, already accounting for `quantity`). Consumers must sum `item.price` directly rather than multiplying `item.quantity * item.price` again.
 
 ### POST `/api/duplicate-check`

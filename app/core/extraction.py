@@ -26,7 +26,7 @@ from app.core.extractors import (
     text_lines,
 )
 from app.core.items import ItemScan, parse_items, reconcile_items
-from app.core.layout import LayoutScan, scan_layout
+from app.core.layout import LayoutScan, classify_discount_type, scan_layout
 from app.core.financial_semantics import FinancialSemantics, infer_tax_basis
 from app.core.locale import LocaleGuess, resolve_locale
 from app.core.ocr_engine import OcrBundle
@@ -167,6 +167,13 @@ def extract(
 
     item_scan = _best_items(bundle, money, tax_basis)
     vat_classification = classify_tax(combined, locale, money.get("tax_amount"))
+    discount_lines = [
+        str(entry.get("line_text") or entry.get("label") or "")
+        for entry in (money.discount_breakdown if money else [])
+    ]
+    discount_type = classify_discount_type(
+        money.get("discount_amount"), discount_lines=discount_lines, full_text=combined
+    )
 
     extraction.fields = {
         "country": locale.country,
@@ -189,6 +196,7 @@ def extract(
         "total_discrepancy": money.discrepancy,
         "service_charge": money.get("service_charge"),
         "discount_amount": money.get("discount_amount"),
+        "discount_type": discount_type,
         "withholding_tax": money.get("withholding_tax"),
         "total_amount": money.get("total_amount"),
         "vat_classification": vat_classification,
@@ -202,6 +210,8 @@ def extract(
     extraction.item_scan = item_scan
 
     extraction.evidence.update(money.evidence)
+    if discount_type:
+        extraction.evidence["discount_type"] = f"classified={discount_type} from {discount_lines or ['receipt text']}"
     if location:
         extraction.evidence["location"] = location
 
@@ -264,14 +274,26 @@ def _best_items(bundle: OcrBundle, money: MoneyResult, tax_basis: str = "unknown
     # and every row is discarded, so the subtotal implied by the total is offered
     # as a fallback candidate even when tax_basis is unresolved.
     total = money.get("total_amount")
+    discount = money.get("discount_amount") or 0.0
+    tax_amt = money.get("tax_amount") or 0.0
+    svc_amt = money.get("service_charge") or 0.0
     if total is not None:
         implied = round(
-            total - (money.get("tax_amount") or 0.0)
-            - (money.get("service_charge") or 0.0), 2
+            total - tax_amt - svc_amt, 2
         )
         targets["total_amount"] = total
         if implied > 0 and abs(implied - total) > 0.005:
             targets["total_less_tax_and_charges"] = implied
+        if discount > 0:
+            targets["total_plus_discount"] = round(total + discount - svc_amt, 2)
+            implied_pre_discount = round(total + discount - tax_amt - svc_amt, 2)
+            if implied_pre_discount > 0:
+                targets["total_plus_discount_less_tax"] = implied_pre_discount
+            if tax_amt > 0:
+                # Statutory PH Senior/PWD receipts deduct both 12% VAT and 20% discount from gross items
+                targets["total_plus_discount_and_vat"] = round(total + discount + tax_amt - svc_amt, 2)
+    if discount > 0 and money.get("net_sales") is not None:
+        targets["net_sales_plus_discount"] = round((money.get("net_sales") or 0.0) + discount, 2)
 
     best: ItemScan | None = None
     for reading in bundle.all_readings:

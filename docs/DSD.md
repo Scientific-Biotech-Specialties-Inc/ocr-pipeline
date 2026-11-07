@@ -64,6 +64,8 @@ Stores complete metadata payloads.
     "transaction_date": "string (YYYY-MM-DD)",
     "total_amount": "double",
     "vat_amount": "double",
+    "discount_amount": "double (optional)",
+    "discount_type": "string (optional: senior | pwd | student | promo | employee | other)",
     "tin": "string",
     "invoice_number": "string",
     "confidence_score": "double",
@@ -152,6 +154,6 @@ erDiagram
 - **Seed Data:** Pytest suites load mock vector arrays and dummy receipt structures into local test databases on-the-fly and tear them down during test teardown.
 
 ## 1.3 Financial semantics audit data
-The `ocr_jobs` document may contain `financial_semantics` and an expanded `reconciliation` object. The latter retains `tax_basis`, `financial_reconciliation_status`, `reported_total`, `computed_total`, `discrepancy`, `needs_manual_review`, and each genuine tax line in `tax_breakdown`; charges and discounts remain separate fields. Multiple tax labels are aggregated only when the existing geometry scanner identifies them as tax lines. Ambiguous or unsupported cases abstain rather than infer a total.
+The `ocr_jobs` document may contain `financial_semantics` and an expanded `reconciliation` object. The latter retains `tax_basis`, `financial_reconciliation_status`, `reported_total`, `computed_total`, `discrepancy`, `needs_manual_review`, `discount_breakdown`, and each genuine tax line in `tax_breakdown`; charges and discounts remain separate fields. Multiple tax or discount lines are aggregated into `vat_amount` and `discount_amount` respectively. Ambiguous or unsupported cases abstain rather than infer a total.
 
-The extracted result also carries the optional callback fields `tax_basis`, `financial_reconciliation_status`, and `needs_manual_review`; legacy callback fields are preserved.
+The extracted result also carries the optional callback fields `discount_amount`, `discount_type`, `tax_basis`, `financial_reconciliation_status`, and `needs_manual_review`; legacy callback fields are preserved.

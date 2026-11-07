@@ -212,6 +212,9 @@ def _parse_region(lines: list[list[Word]], require_marker: bool) -> list[Extract
             continue
 
         label = _best_label(text)
+        if label and label[0] == "discount_amount":
+            _flush_pending()
+            continue
         if label and label[0] in SUMMARY_FIELDS:
             _flush_pending()
             if seen_item:
@@ -327,7 +330,7 @@ def _build_item(
 ) -> ExtractedItem | None:
     """Build an item from a line with its money words already removed."""
     price = normalize_money(money_token)
-    if price is None or price == 0:
+    if price is None or price <= 0:
         return None
 
     quantity = 1

@@ -48,6 +48,7 @@ class MoneyResult:
     financial_reconciliation_status: str = "unresolved"
     needs_manual_review: bool = False
     tax_breakdown: list[dict[str, object]] = field(default_factory=list)
+    discount_breakdown: list[dict[str, object]] = field(default_factory=list)
 
     def get(self, name: str) -> float | None:
         return self.values.get(name)
@@ -71,12 +72,26 @@ def resolve_money(
         candidates = scan.all(name)
         if name == "tax_amount" and candidates:
             parsed = [normalize_money(item.raw_token, country) for item in candidates]
-            values = [value for value in parsed if value is not None]
+            values = [abs(value) if item.label.startswith("less") else value for item, value in zip(candidates, parsed) if value is not None]
             if values:
                 result.values[name] = round(sum(values), 2)
                 result.tax_breakdown = [
-                    {"amount": value, "label": item.label, "evidence": item.evidence}
+                    {"amount": abs(value) if item.label.startswith("less") else value, "label": item.label, "evidence": item.evidence}
                     for item, value in zip(candidates, parsed) if value is not None
+                ]
+                result.evidence[name] = "; ".join(item.evidence for item in candidates)
+                continue
+        if name == "discount_amount" and candidates:
+            parsed = [normalize_money(item.raw_token, country) for item in candidates]
+            values = [abs(value) for value in parsed if value is not None and abs(value) > 0]
+            if values:
+                total_disc = round(sum(values), 2)
+                result.values[name] = total_disc
+                if len(values) > 1:
+                    result.derived.add(name)
+                result.discount_breakdown = [
+                    {"amount": abs(value), "label": item.label, "line_text": item.line_text, "evidence": item.evidence}
+                    for item, value in zip(candidates, parsed) if value is not None and abs(value) > 0
                 ]
                 result.evidence[name] = "; ".join(item.evidence for item in candidates)
                 continue
@@ -85,6 +100,8 @@ def resolve_money(
             result.values[name] = None
             continue
         value = normalize_money(labeled.raw_token, country)
+        if value is not None and name in ("discount_amount", "withholding_tax"):
+            value = abs(value)
         result.values[name] = value
         if value is not None:
             result.evidence[name] = labeled.evidence
@@ -106,6 +123,7 @@ def _fill_gaps(
     total_sales = result.get("total_sales")
     total = result.get("total_amount")
     service = result.get("service_charge") or 0.0
+    discount = result.get("discount_amount") or 0.0
     is_ph = country == "PH"
 
     if is_ph and not vat_registered:
@@ -151,14 +169,14 @@ def _fill_gaps(
     grounded_net = net is not None and "net_sales" not in result.derived
     grounded_tax = tax is not None and "tax_amount" not in result.derived
     if tax_basis == "exclusive" and grounded_net and grounded_tax:
-        computed = round(net + tax + service, 2)
+        computed = round(net - discount + tax + service, 2)
         result.computed_total = computed
         result.discrepancy = round((result.reported_total - computed), 2) if result.reported_total is not None else None
         if total is None:
             result.values["total_amount"] = computed
             result.derived.add("total_amount")
             result.derivations.add("total_from_net_tax_exclusive")
-            result.evidence["total_amount"] = f"computed: net {net} + tax {tax} + service {service}"
+            result.evidence["total_amount"] = f"computed: net {net} - discount {discount} + tax {tax} + service {service}"
             result.financial_reconciliation_status = "computed"
         elif abs(total - computed) <= TOLERANCE:
             result.financial_reconciliation_status = "reported"
@@ -179,12 +197,12 @@ def _fill_gaps(
     # Inclusive totals are already gross: never add tax to total_sales. A printed
     # sales total may be carried to callback only when a money token supports it.
     if total is None and tax_basis == "inclusive" and total_sales is not None:
-        candidate = round(total_sales + service, 2)
+        candidate = round(total_sales - discount + service, 2)
         if _token_present(candidate, scan, country):
             result.values["total_amount"] = candidate
             result.derived.add("total_amount")
             result.derivations.add("total_from_sales")
-            result.evidence["total_amount"] = f"derived: inclusive total sales {total_sales} + service {service}"
+            result.evidence["total_amount"] = f"derived: inclusive total sales {total_sales} - discount {discount} + service {service}"
     # Unknown basis intentionally leaves total_amount untouched.
 
 
@@ -203,6 +221,7 @@ def _reconcile(result: MoneyResult, country: str | None, tax_basis: str) -> None
     total_sales = result.get("total_sales")
     total = result.get("total_amount")
     service = result.get("service_charge") or 0.0
+    discount = result.get("discount_amount") or 0.0
     checks: list[bool] = []
     derivations = result.derivations
 
@@ -211,7 +230,10 @@ def _reconcile(result: MoneyResult, country: str | None, tax_basis: str) -> None
         plausible = PLAUSIBLE_RATE_RANGE[0] <= rate <= PLAUSIBLE_RATE_RANGE[1]
         result.tax_rate = PH_VAT_RATE if country == "PH" and tax_basis == "inclusive" else round(rate, 4)
         if country == "PH" and tax_basis == "inclusive" and "tax_from_net" not in derivations:
-            checks.append(abs(net * PH_VAT_RATE - tax) <= max(TOLERANCE, net * 0.001))
+            vat_ok = abs(net * PH_VAT_RATE - tax) <= max(TOLERANCE, net * 0.001)
+            if not vat_ok and discount > 0 and abs((net - discount) * PH_VAT_RATE - tax) <= max(TOLERANCE, net * 0.001):
+                vat_ok = True
+            checks.append(vat_ok)
             result.reconciliation_notes.append(
                 f"PH VAT identity net*0.12={net * PH_VAT_RATE:.2f} vs tax={tax:.2f}"
             )
@@ -225,7 +247,10 @@ def _reconcile(result: MoneyResult, country: str | None, tax_basis: str) -> None
         if "sales_from_net_tax" in derivations or {"net_from_sales", "tax_from_net"} <= derivations:
             result.reconciliation_notes.append("net+tax identity skipped: figures derived from one another")
         else:
-            ok = abs(net + tax - total_sales) <= TOLERANCE
+            ok = (
+                abs(net + tax - total_sales) <= TOLERANCE
+                or (discount > 0 and abs(net + tax - discount - total_sales) <= TOLERANCE)
+            )
             checks.append(ok)
             result.reconciliation_notes.append(
                 f"net+tax={net + tax:.2f} vs total_sales={total_sales:.2f} -> {'ok' if ok else 'FAIL'}"
@@ -236,20 +261,29 @@ def _reconcile(result: MoneyResult, country: str | None, tax_basis: str) -> None
         if total_is_circular:
             result.reconciliation_notes.append("total identity skipped: total and sales derived from one another")
         else:
-            ok = abs(total_sales + service - total) <= TOLERANCE
+            expected_net_total = total_sales - discount + service
+            ok = abs(expected_net_total - total) <= TOLERANCE
+            # Statutory PH discounts (Senior/PWD) deduct both 12% VAT and 20% discount from gross sales
+            if not ok and discount > 0 and tax is not None and abs(total_sales - tax - discount + service - total) <= TOLERANCE:
+                ok = True
+            if not ok and discount > 0 and net is not None and abs(net - discount + service - total) <= TOLERANCE:
+                ok = True
+            if not ok and discount > 0 and abs(total_sales + service - total) <= TOLERANCE:
+                # Some receipts report total_sales already net of discount
+                ok = True
             checks.append(ok)
             result.reconciliation_notes.append(
-                f"total_sales+service={total_sales + service:.2f} vs total={total:.2f} -> {'ok' if ok else 'FAIL'}"
+                f"total_sales-discount+service={expected_net_total:.2f} vs total={total:.2f} -> {'ok' if ok else 'FAIL'}"
             )
 
     if tax is None and net is not None and total is not None and not service:
         if "net_sales" in result.derived:
             result.reconciliation_notes.append("no-tax identity skipped: net was derived from the total")
         else:
-            ok = abs(net - total) <= TOLERANCE
+            ok = abs(net - discount - total) <= TOLERANCE or abs(net - total) <= TOLERANCE
             checks.append(ok)
             result.reconciliation_notes.append(
-                f"no-tax receipt: net={net:.2f} vs total={total:.2f} -> {'ok' if ok else 'FAIL'}"
+                f"no-tax receipt: net-discount={net - discount:.2f} vs total={total:.2f} -> {'ok' if ok else 'FAIL'}"
             )
 
     result.reconciled = bool(checks) and all(checks)
@@ -257,6 +291,7 @@ def _reconcile(result: MoneyResult, country: str | None, tax_basis: str) -> None
         result.financial_reconciliation_status = "reconciled"
     elif not result.reconciled and result.financial_reconciliation_status == "unresolved":
         result.reconciliation_notes.append("no identity could be checked" if not checks else "identity failed")
+
 
 
 def resolve_tax_type(

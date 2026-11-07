@@ -131,6 +131,16 @@ class OcrCallbackPayload(BaseModel):
     financial_reconciliation_status: Optional[str] = None
     needs_manual_review: Optional[bool] = None
     subtotal: Optional[float] = Field(default=None, ge=0)
+    discount_amount: Optional[float] = Field(default=None, ge=0)
+    discount_type: Optional[str] = None
+
+    @field_validator("discount_type", mode="before")
+    @classmethod
+    def restrict_discount_type(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = str(value).strip().lower()
+        return normalized if normalized in ("none", "senior", "pwd", "student", "promo", "employee", "other") else None
 
     @field_validator("vat_classification", mode="before")
     @classmethod
@@ -173,7 +183,10 @@ class OcrCallbackPayload(BaseModel):
         data = super().model_dump(*args, **kwargs)
         # New fields are optional and omitted when unset, preserving legacy
         # callback payload shape while exposing them when the pipeline has a value.
-        for key in ("tax_basis", "financial_reconciliation_status", "needs_manual_review", "subtotal"):
+        for key in (
+            "tax_basis", "financial_reconciliation_status", "needs_manual_review",
+            "subtotal", "discount_amount", "discount_type",
+        ):
             if data.get(key) is None:
                 data.pop(key, None)
         return data
@@ -207,6 +220,8 @@ def build_callback_payload(
     financial_reconciliation_status: str | None = None,
     needs_manual_review: bool | None = None,
     subtotal: float | None = None,
+    discount_amount: float | None = None,
+    discount_type: str | None = None,
 ) -> OcrCallbackPayload:
     """Map the internal field set onto the SERMS contract.
 
@@ -219,6 +234,10 @@ def build_callback_payload(
     resolved_subtotal = subtotal if subtotal is not None else (
         fields_dict.get("subtotal") if fields_dict.get("subtotal") is not None else fields_dict.get("net_sales")
     )
+    resolved_discount_amount = discount_amount if discount_amount is not None else fields_dict.get("discount_amount")
+    resolved_discount_type = discount_type if discount_type is not None else fields_dict.get("discount_type")
+    if resolved_discount_amount is not None and resolved_discount_amount > 0 and not resolved_discount_type:
+        resolved_discount_type = "other"
     return OcrCallbackPayload(
         receipt_id=receipt_id,
         vendor_name=fields_dict.get("vendor_name"),
@@ -226,6 +245,8 @@ def build_callback_payload(
         total_amount=fields_dict.get("total_amount"),
         subtotal=resolved_subtotal,
         vat_amount=fields_dict.get("tax_amount"),
+        discount_amount=resolved_discount_amount,
+        discount_type=resolved_discount_type,
         tin=fields_dict.get("vendor_tax_id"),
         invoice_number=fields_dict.get("invoice_number"),
         vat_classification=fields_dict.get("vat_classification"),
