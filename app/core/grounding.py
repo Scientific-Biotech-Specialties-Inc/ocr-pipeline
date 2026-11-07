@@ -85,10 +85,22 @@ def is_grounded(field_name: str, value: Any, ocr_text: str) -> bool:
         parsed = parse_date_value(value)
         return parsed is not None and _date_appears(parsed, ocr_text, digit_stream)
     if kind is FieldKind.FUZZY_TEXT:
-        return (
-            fuzz.partial_ratio(normalize_text(value), normalize_text(ocr_text))
+        normalized_target = normalize_text(value)
+        normalized_corpus = normalize_text(ocr_text)
+        if (
+            fuzz.partial_ratio(normalized_target, normalized_corpus)
             >= FUZZY_GROUNDING_THRESHOLD
-        )
+        ):
+            return True
+        if field_name == "location" and "," in str(value):
+            clauses = [c.strip() for c in str(value).split(",") if len(c.strip()) >= 3]
+            if clauses and all(
+                fuzz.partial_ratio(normalize_text(clause), normalized_corpus)
+                >= FUZZY_GROUNDING_THRESHOLD
+                for clause in clauses
+            ):
+                return True
+        return False
     return normalize_text(value) in normalize_text(ocr_text)
 
 

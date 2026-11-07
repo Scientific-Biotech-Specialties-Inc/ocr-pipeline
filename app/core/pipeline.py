@@ -450,6 +450,29 @@ async def _read_and_extract(
                     caller_location=caller_location,
                 )
                 if fast_path_sufficient(baseline) and baseline.fields.get("transaction_date") is not None:
+                    # Check if location or vendor is missing; try cheap header crop recovery before shipping
+                    needs_header_rec = (
+                        (baseline.fields.get("location") is None and caller_location is None)
+                        or baseline.fields.get("vendor_name") is None
+                    )
+                    if needs_header_rec:
+                        try:
+                            loop = asyncio.get_running_loop()
+                            rec_reading = await loop.run_in_executor(
+                                ocr_executor, read_region_recovery, image, 0.0, 0.30, "eng"
+                            )
+                            if rec_reading:
+                                bundle.supporting.append(rec_reading)
+                                bundle.all_readings.append(rec_reading)
+                                baseline = extract(
+                                    bundle,
+                                    caller_country=caller_country,
+                                    caller_currency=caller_currency,
+                                    caller_location=caller_location,
+                                )
+                        except Exception as rec_exc:  # noqa: BLE001
+                            logger.debug("Header region recovery skipped: %s", rec_exc)
+
                     await normalize_extraction(baseline, bundle, use_llm=False)
                     return bundle, baseline, t_engine, 0.0
 
@@ -581,10 +604,11 @@ async def _read_and_extract_segments(
         baseline.fields.get("vendor_name") is None and baseline.fields.get("vendor_tax_id") is None
     )
     needs_date_recovery = baseline.fields.get("transaction_date") is None
-    if (needs_total_recovery or needs_vendor_recovery or needs_date_recovery) and ordered_pairs:
+    needs_location_recovery = baseline.fields.get("location") is None and caller_location is None
+    if (needs_total_recovery or needs_vendor_recovery or needs_date_recovery or needs_location_recovery) and ordered_pairs:
         logger.info(
-            "Multi-segment fast path: targeted recovery triggered (needs_total=%s, needs_vendor=%s, needs_date=%s)",
-            needs_total_recovery, needs_vendor_recovery, needs_date_recovery,
+            "Multi-segment fast path: targeted recovery triggered (needs_total=%s, needs_vendor=%s, needs_date=%s, needs_location=%s)",
+            needs_total_recovery, needs_vendor_recovery, needs_date_recovery, needs_location_recovery,
         )
         t0_rec = time.perf_counter()
         recovery_tasks = []
@@ -594,8 +618,8 @@ async def _read_and_extract_segments(
             recovery_tasks.append(
                 loop.run_in_executor(ocr_executor, read_region_recovery, last_img, 0.65, 1.0, "eng")
             )
-        if (needs_vendor_recovery or needs_date_recovery) and ordered_pairs:
-            # Top 30% of the first segment (where vendor/TIN/header-date resides)
+        if (needs_vendor_recovery or needs_date_recovery or needs_location_recovery) and ordered_pairs:
+            # Top 30% of the first segment (where vendor/TIN/header-date/location resides)
             first_img, _ = ordered_pairs[0]
             recovery_tasks.append(
                 loop.run_in_executor(ocr_executor, read_region_recovery, first_img, 0.0, 0.30, "eng")
@@ -747,11 +771,14 @@ async def _extract_with_assists(
 
 
 def _closed_list_pick(value: object, candidates: list[str]) -> str | None:
-    """Reject any answer outside the offered closed list."""
+    """Reject any answer outside the offered closed list, allowing fuzzy alignment."""
     if not value or not isinstance(value, str):
         return None
     picked = value.strip()
-    return picked if picked in candidates else None
+    if picked in candidates:
+        return picked
+    from app.core.vendor import _closest_candidate
+    return _closest_candidate(picked, candidates)
 
 
 def _float_or_none(value: object) -> float | None:

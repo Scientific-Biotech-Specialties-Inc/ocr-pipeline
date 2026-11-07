@@ -5,8 +5,13 @@ downgraded, and receipt 3's misread tax figure must not ship.
 """
 
 from app.core.verification import (
-    REASON_HANDWRITTEN, REASON_NO_TOTAL, REASON_RECONCILE, REASON_REJECTED,
-    coerce_category, looks_illegible, verify,
+    REASON_HANDWRITTEN,
+    REASON_NO_TOTAL,
+    REASON_RECONCILE,
+    REASON_REJECTED,
+    coerce_category,
+    looks_illegible,
+    verify,
 )
 
 PRINTED_TEXT = (
@@ -58,6 +63,28 @@ class TestGroundingRejection:
         )
         assert result.fields["transaction_date"] == "2025-05-24"
         assert not result.rejected
+
+    def test_multi_line_joined_location_is_grounded(self):
+        result = verify(
+            {"location": "3890 S Maryland Parkway Suite 137, Las Vegas NV 89119"},
+            PRINTED_TEXT,
+            reconciled=True,
+            locale_resolved=True,
+            mean_word_confidence=0.9,
+        )
+        assert result.fields["location"] == "3890 S Maryland Parkway Suite 137, Las Vegas NV 89119"
+        assert not result.rejected
+
+    def test_fabricated_location_is_rejected(self):
+        result = verify(
+            {"location": "999 Hollywood Blvd, Los Angeles CA 90028"},
+            PRINTED_TEXT,
+            reconciled=True,
+            locale_resolved=True,
+            mean_word_confidence=0.9,
+        )
+        assert result.fields["location"] is None
+        assert "location" in result.rejected
 
     def test_ocr_recovered_date_is_grounded(self):
         result = verify(

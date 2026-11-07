@@ -122,6 +122,16 @@ Deterministic receipt wording and grounded arithmetic outrank the model. Caller 
 
 Tax-basis fallbacks are per-country so Malaysian receipts stay deterministic offline: `MY` receipts carrying `SST`/`GST` wording are treated as exclusive (tax added on top of the subtotal), which lets `total_sales = net + tax` derive even when the model assist is unavailable. Currency detection ignores the `Sdn. Bhd.` company suffix (a common Malaysian register suffix) so it is never misread as the `BHD` currency code. Invoice-number lookup accepts semicolon and comma separators in addition to `:`, `.`, and `#`, because fast-path single-pass OCR frequently transcribes `Invoice number; 12345` and `No, 38326`.
 
+### 2.3.1 Store Location & Address Extraction
+Location extraction retrieves the store/merchant premises and locality from receipt headers and guarded footers:
+1. **Multi-Line Assembly & Permissive Filtering:** Address lines often contain abbreviations, numbers, and ZIP codes that fail naive dictionary word checks (`looks_like_words`). `looks_like_address_line` validates lines with digit/letter ratios common to suite/unit numbers and postal codes. Consecutive valid address lines (up to 3 lines) are concatenated into unified, comma-separated candidate addresses.
+2. **Locality Coverage & Premises Recognition:** Candidate recognition encompasses thoroughfares (`st`, `ave`, `rd`, `blvd`, `pkwy`, `dr`, `lane`, `jalan`), premises (`unit`, `suite`, `flr`, `bldg`, `tower`, `mall`, `square`), Philippines regional/city/barangay anchors (NCR, Makati, Manila, Cebu, Davao, Cavite, Laguna, etc.), US state codes and metropolitan areas, and Southeast Asian localities (MY, BN, SG).
+3. **Anti-Hallucination & Boundary Guards:**
+   - **Customer Section Marker Guards:** When lines matching `SOLD TO:`, `CUSTOMER NAME:`, `BILL TO:`, or `Business Address:` appear, header address collection halts immediately to avoid extracting customer details as merchant locations.
+   - **Printer Accreditation Exclusions:** Lines containing `PRINTERS ACCREDITATION`, `AUTHORITY TO PRINT`, `DATE OF ATP`, or `PTU` immediately terminate header reading so print-shop addresses (`LILEDAU PRINTERS ...`) are never extracted.
+   - **Vendor Name De-duplication:** Lines matching the selected `vendor_name` are rejected from address candidates and prohibited from entering consecutive address chains.
+4. **Dictionary Protection & Grounding:** Post-processing normalizer excludes `location` from dictionary corrections so culinary/item lexicons never corrupt street or town names. Grounding verification checks multi-clause address strings by splitting on commas and verifying constituent clauses against OCR evidence.
+
 ## 2.4 Multi-Segment & Long Receipt Pipeline
 Long thermal receipts (e.g., supermarket runs with 20–100+ items) frequently present either as multiple overlapping uploaded photos (`file_urls`) or a single high-aspect-ratio panorama. Processing them through monolithic image stitching or single-pass detector resize causes acute issues: duplicated seam items, detector downscaling blur, and Tesseract thread thrashing on anchorless middle segments.
 

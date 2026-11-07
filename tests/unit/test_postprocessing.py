@@ -1,8 +1,9 @@
 import pytest
 
-from app.core.postprocessing import DictionaryCorrector, LLMContextCorrector
-from app.core.ocr_engine import OcrBundle, OcrReading, Word
 from app.core.extraction import Extraction
+from app.core.ocr_engine import OcrBundle, OcrReading, Word
+from app.core.postprocessing import DictionaryCorrector, LLMContextCorrector
+
 
 @pytest.fixture
 def mock_bundle():
@@ -74,8 +75,8 @@ async def test_llm_corrector_mocked(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_normalize_extraction_item_mutation(mock_bundle, monkeypatch):
-    from app.llm.base import LLMProvider
     from app.core.items import ExtractedItem, ItemScan
+    from app.llm.base import LLMProvider
     
     class MockProvider(LLMProvider):
         async def extract_receipt_fields(self, ocr_text: str) -> dict:
@@ -116,8 +117,8 @@ async def test_normalize_extraction_item_mutation(mock_bundle, monkeypatch):
 @pytest.mark.asyncio
 async def test_normalize_extraction_use_llm_false_skips_model(mock_bundle, monkeypatch):
     """Fast path must stay deterministic: dictionary-only, zero model calls."""
-    from app.core.items import ExtractedItem, ItemScan
     import app.core.postprocessing
+    from app.core.items import ExtractedItem, ItemScan
 
     called = {"model": False}
 
@@ -157,8 +158,8 @@ async def test_normalize_extraction_use_llm_false_skips_model(mock_bundle, monke
 
 @pytest.mark.asyncio
 async def test_normalize_extraction_use_llm_false_preserves_descriptions_clear(mock_bundle, monkeypatch):
-    from app.core.items import ExtractedItem, ItemScan
     import app.core.postprocessing
+    from app.core.items import ExtractedItem, ItemScan
 
     class DictPassthrough:
         def correct_phrase(self, phrase, bundle):
@@ -284,3 +285,17 @@ async def test_llm_corrector_skips_tiny_genuine_batches(monkeypatch):
 
     assert called["batch"] is False
     assert corrected == items
+
+
+@pytest.mark.asyncio
+async def test_normalize_extraction_preserves_location(mock_bundle):
+    from app.core.postprocessing import normalize_extraction
+
+    extraction = Extraction(
+        fields={
+            "location": "3890 S Maryland Parkway Suite 137, Las Vegas NV 89119",
+            "vendor_name": "Jollibee",
+        }
+    )
+    await normalize_extraction(extraction, mock_bundle, use_llm=False)
+    assert extraction.fields["location"] == "3890 S Maryland Parkway Suite 137, Las Vegas NV 89119"

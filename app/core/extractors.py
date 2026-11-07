@@ -12,8 +12,10 @@ import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
+from rapidfuzz import fuzz
+
 from app.core.ocr_engine import Word
-from app.core.textquality import looks_like_words
+from app.core.textquality import looks_like_address_line, looks_like_words
 
 # ---------------------------------------------------------------------------
 # tax identifiers
@@ -605,67 +607,260 @@ def find_vendor_candidates(
     return result
 
 
+_US_STATE_CODES = (
+    r"AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|"
+    r"MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY|DC"
+)
+
 ADDRESS_KEYWORDS = (
-    " st.", " st ", "street", " ave", "avenue", "road", " rd", "brgy", "barangay",
-    "city", "unit ", "blk", "block", "suite", "floor", " flr", "bldg", "building",
-    "district", "province", "philippines", "zip", "p.o. box", "highway", "hwy",
-    "subdivision", "subd", "drive", "dr.", "blvd", "boulevard", "plaza", "center",
-    "centre", "mall", "tower", "metro", "manila", "makati", "quezon", "taguig", "pasig",
-    "mandaluyong", "cebu", "davao", "pasay", "paranaque",
+    # Thoroughfares & Premises
+    " street", " st.", " st ", " st,", " avenue", " ave.", " ave ", " ave,", " road", " rd.", " rd ", " rd,",
+    " highway", " hwy", " parkway", " pkwy", " boulevard", " blvd", " drive", " dr.", " dr ", " lane", " ln.",
+    " expressway", " express way", " circle", " cir.", " way", " walk",
+    " building", " bldg", " floor", " flr", " suite", " ste.", " ste ", " unit ", " room", " rm.", " rm ",
+    " stall", " space", " kiosk", " level", " lvl", " tower", " plaza", " center", " centre", " square",
+    " mall", " complex", " village", " vlg", " arcade", " hub", " compound",
+    " block", " blk", " lot ", " phase", " purok", " sitio", " zone ", " barangay", " brgy",
+    " district", " dist.", " province", " subdivision", " subd", " corner", " cor.",
+    " jalan", " jln", " lorong", " kampong", " p.o. box", " po box", " zip", " postal",
+    # Philippines Key Localities
+    "philippines", "metro manila", "ncr", "manila", "makati", "quezon", "taguig", "pasig", "mandaluyong",
+    "cebu", "davao", "pasay", "paranaque", "parañaque", "binondo", "ermita", "malate", "sampaloc", "tondo",
+    "intramuros", "caloocan", "valenzuela", "marikina", "muntinlupa", "las pinas", "las piñas", "san juan",
+    "malabon", "navotas", "pateros", "rizal", "antipolo", "taytay", "cainta", "rodriguez", "san mateo",
+    "cavite", "bacoor", "imus", "dasmarinas", "dasmariñas", "tagaytay", "general trias", "laguna", "binan", "biñan",
+    "santa rosa", "calamba", "san pedro", "cabuyao", "bulacan", "meycauayan", "malolos", "marilao", "santa maria",
+    "pampanga", "angeles", "san fernando", "clark", "batangas", "lipa", "iloilo", "bacolod", "baguio",
+    "cagayan de oro", "zamboanga", "general santos", "subic", "olongapo", "palawan", "boracay", "bohol", "leyte",
+    "tacloban", "naga", "legazpi", "dagupan", "tarlac", "bataan", "la union", "ilocos", "bukidnon", "butuan",
+    "surigao", "cotabato",
+    # International Localities
+    "kuala lumpur", "malaysia", "selangor", "johor", "penang", "brunei", "bandar seri begawan", "yayasan",
+    "singapore", "las vegas", "san francisco", "san jose", "allentown", "memphis", "okemos", "seattle",
+    "boca raton", "washington", "new york", "los angeles", "chicago", "houston", "philadelphia", "phoenix",
+    "san antonio", "san diego", "dallas", "austin",
 )
 
 ADDRESS_PATTERNS = re.compile(
     r"\b\d+\s*/\s*[a-z]\b"
-    r"|\b[a-z]?\d+\s*(?:st|nd|rd|th)\s+(?:floor|flr)\b"
+    r"|\b[a-z]?\d+\s*(?:st|nd|rd|th)\s+(?:floor|flr|level|lvl)\b"
     r"|\bcor\.?\s"
-    r"|\b(?:blvd|ave|st|rd|hwy|lot|blk|brgy|bldg|unit|suite|rm)\b\.?"
-    r"|\b\d{4,5}\b.*\b(?:city|manila|philippines)\b",
+    r"|\b(?:blvd|ave|st|rd|hwy|pkwy|lot|blk|brgy|bldg|unit|suite|ste|rm)\b\.?"
+    r"|\b(?:" + _US_STATE_CODES + r")\s+\d{5}(?:-\d{4})?\b"
+    r"|,\s*(?:" + _US_STATE_CODES + r")\b"
+    r"|\b\d{4,5}\b.*\b(?:city|manila|philippines|ncr|qc)\b",
     re.IGNORECASE,
 )
 
+CUSTOMER_SECTION_MARKERS = (
+    "sold to", "received from", "registered name", "customer name", "name of customer",
+    "bill to", "ship to", "business address", "address/tin", "address / tin",
+    "and address at", "business style", "customer:", "customer :",
+)
+
+PRINTER_ATP_MARKERS = (
+    "authority to print", "printers accreditation", "printer's accreditation",
+    "accreditation no", "date of atp", "bir permit", "permit no", "ptu",
+    "ocn", "bklts", "booklets", "dependable pckg", "liledau", "printing services",
+    "this provisional receipt", "valid for five", "valid until", "series of",
+)
+
+BLANK_ADDRESS_LINE_RE = re.compile(r"^\s*(?:business\s+)?address\s*[:._\-\s]*$", re.IGNORECASE)
+
+
+def _tidy_address(text: str) -> str:
+    cleaned = text.strip()
+    cleaned = re.sub(
+        r"^(?:business\s+address|store\s+address|address|location|loc|branch)\s*[:.\-]\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"(?:tel\.?|telefax\.?|phone\.?|mobile\.?|fax\.?|contact\.?)\s*(?:no\.?|#)?\s*[:.\-]?\s*[0-9\-\s\(\)\/]{5,}",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"(?:vat\s*reg\.?\s*)?tin\s*[:.\-]?\s*[0-9\-\s]{9,}",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", "", cleaned)
+    cleaned = re.sub(r"https?://\S+|www\.\S+", "", cleaned)
+    cleaned = re.sub(r"\s*\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}$", "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" |_-*:;,.<>~@\\/{}()[]#=")
+    return cleaned[:255].strip()
+
+
+def _is_address_candidate_line(line: str) -> bool:
+    stripped = line.strip()
+    if not looks_like_address_line(stripped):
+        return False
+    if BLANK_ADDRESS_LINE_RE.match(stripped):
+        return False
+    lowered = stripped.casefold()
+    if any(bad in lowered for bad in PRINTER_ATP_MARKERS):
+        return False
+    if any(bad in lowered for bad in CUSTOMER_SECTION_MARKERS):
+        return False
+    return any(kw in lowered for kw in ADDRESS_KEYWORDS) or bool(ADDRESS_PATTERNS.search(stripped))
+
 
 def find_address_candidates(
-    line_sets: list[list[tuple[str, float]]], header_lines: int = 15
+    line_sets: list[list[tuple[str, float]]],
+    header_lines: int = 18,
+    vendor_name: str | None = None,
+    customer_names: list[str] | None = None,
 ) -> list[str]:
-    """Collect plausible location/address candidate lines from printed receipt headers."""
+    """Collect and rank plausible location/address candidate lines from receipt headers and guarded footers."""
+    customer_names = customer_names or []
     candidates: dict[str, CandidateMeta] = {}
 
+    def _register_candidate(cand_text: str, line_idx: int, conf: float) -> None:
+        cleaned = _tidy_address(cand_text)
+        if not cleaned or len(cleaned) < 4:
+            return
+        existing = candidates.get(cleaned)
+        if existing is None:
+            candidates[cleaned] = CandidateMeta(index=line_idx, confidence=conf)
+        else:
+            existing.index = min(existing.index, line_idx)
+            existing.confidence = max(existing.confidence, conf)
+            existing.occurrences += 1
+
+    # 1. Header scan across all readings
     for lines in line_sets:
+        consecutive_addr: list[tuple[int, str, float]] = []
         for index, (line_text, confidence) in enumerate(lines[:header_lines]):
             stripped = line_text.strip()
             lowered = stripped.casefold()
-            if any(bad in lowered for bad in VENDOR_NAME_EXCLUSIONS):
-                continue
-            if VENDOR_NAME_EXCLUSION_WORDS.search(stripped):
-                continue
-            if DOCUMENT_TITLE_RE.search(stripped):
-                continue
+
+            # Stop header scan on customer section, column headings, or printer accreditation
+            if any(marker in lowered for marker in CUSTOMER_SECTION_MARKERS):
+                break
             if _is_column_heading(stripped):
-                continue
-            if not looks_like_words(stripped):
-                continue
+                break
+            if any(bad in lowered for bad in PRINTER_ATP_MARKERS):
+                break
 
-            is_address = any(kw in lowered for kw in ADDRESS_KEYWORDS) or bool(ADDRESS_PATTERNS.search(stripped))
-            if not is_address:
-                continue
+            # If this line matches vendor_name, skip it and reset consecutive address chain
+            if vendor_name:
+                v_low = vendor_name.casefold()
+                if lowered == v_low or fuzz.ratio(lowered, v_low) >= 80 or (
+                    len(v_low) >= 6
+                    and v_low in lowered
+                    and not any(
+                        s in lowered
+                        for s in (" street", " st.", " st ", " ave", " rd", " blvd", " pkwy", " suite", " unit")
+                    )
+                ):
+                    consecutive_addr = []
+                    continue
 
-            existing = candidates.get(stripped)
-            if existing is None:
-                candidates[stripped] = CandidateMeta(index=index, confidence=confidence)
+            if _is_address_candidate_line(stripped):
+                consecutive_addr.append((index, stripped, confidence))
+                _register_candidate(stripped, index, confidence)
             else:
-                existing.index = min(existing.index, index)
-                existing.confidence = max(existing.confidence, confidence)
-                existing.occurrences += 1
+                consecutive_addr = []
 
+            # Multi-line consecutive address blocks (up to 3 lines)
+            if len(consecutive_addr) >= 2:
+                idx1, t1, c1 = consecutive_addr[-2]
+                _, t2, c2 = consecutive_addr[-1]
+                two_line = f"{t1}, {t2}"
+                _register_candidate(two_line, idx1, (c1 + c2) / 2.0)
+
+                if len(consecutive_addr) >= 3:
+                    idx0, t0, c0 = consecutive_addr[-3]
+                    three_line = f"{t0}, {t1}, {t2}"
+                    _register_candidate(three_line, idx0, (c0 + c1 + c2) / 3.0)
+
+    # 2. Guarded footer fallback if header scan produced no candidates
+    if not candidates:
+        for lines in line_sets:
+            total_len = len(lines)
+            footer_slice = lines[-12:]
+            for f_idx, (line_text, confidence) in enumerate(footer_slice):
+                abs_index = total_len - len(footer_slice) + f_idx
+                stripped = line_text.strip()
+                lowered = stripped.casefold()
+
+                # Guard against printer ATP or customer blocks in footer
+                surrounding = [
+                    lines[max(0, abs_index + offset)][0].casefold()
+                    for offset in range(-2, 3)
+                    if 0 <= abs_index + offset < total_len
+                ]
+                if any(any(bad in s for bad in PRINTER_ATP_MARKERS) for s in surrounding):
+                    continue
+                if any(any(bad in s for bad in CUSTOMER_SECTION_MARKERS) for s in surrounding):
+                    continue
+
+                if _is_address_candidate_line(stripped):
+                    _register_candidate(stripped, abs_index, confidence)
+
+    # 3. Score and rank candidates
     ranked: list[tuple[str, float]] = []
     for text, info in candidates.items():
-        score = 2.0 - (info.index * 0.15)
+        lowered = text.casefold()
+
+        # Reject candidate if it matches vendor_name or customer_names
+        if vendor_name:
+            v_low = vendor_name.casefold()
+            if lowered == v_low or fuzz.ratio(lowered, v_low) >= 80:
+                continue
+        if customer_names and any(
+            fuzz.token_set_ratio(lowered, c.casefold()) >= 85 for c in customer_names if len(c) >= 4
+        ):
+            continue
+
+        score = 3.0 - (info.index * 0.15)
         score += 1.5 * max(0.0, min(info.confidence, 1.0))
         score += 0.5 * min(info.occurrences - 1, 3)
-        lowered = text.casefold()
-        if "philippines" in lowered or "city" in lowered or "metro" in lowered:
+
+        has_street_or_bldg = any(
+            t in lowered for t in (
+                " st", " ave", " rd", " hwy", " blvd", " pkwy", " dr", " bldg", " floor",
+                " flr", " suite", " ste", " unit", " rm", " plaza", " square", " center",
+                " level", " jalan", " jln", " lot", " blk", " brgy", " barangay",
+            )
+        )
+        has_city_or_region = any(
+            t in lowered for t in (
+                "city", "philippines", "metro", "manila", "makati", "quezon", "pasig",
+                "taguig", "cebu", "davao", "rizal", "cavite", "laguna", "pampanga",
+                "kuala lumpur", "malaysia", "brunei", "singapore", "las vegas", "new york",
+                "san jose", "allentown", "memphis", "okemos",
+            )
+        ) or bool(re.search(r"\b(?:" + _US_STATE_CODES + r")\b", text))
+
+        if has_street_or_bldg and has_city_or_region:
+            score += 3.0
+        elif has_city_or_region:
+            score += 1.5
+        elif has_street_or_bldg:
             score += 1.0
-        ranked.append((text, score))
+
+        if "," in text:
+            score += 1.2
+            # Reward multi-line / multi-part address candidates that cover both premises and city
+            if has_street_or_bldg and has_city_or_region and len(text) >= 25:
+                score += 1.5
+            score += 0.4 * min(text.count(","), 3)
+
+        # More complete address strings break ties over short partial fragments
+        score += 0.01 * min(len(text), 100)
+
+        if any(
+            f" {sfx}" in lowered or lowered.endswith(sfx)
+            for sfx in ("inc", "inc.", "corp", "corp.", "ltd", "ltd.", "co.")
+        ) and not has_street_or_bldg:
+            score -= 2.0
+
+        ranked.append((text, round(score, 3)))
 
     ranked.sort(key=lambda pair: -pair[1])
     return [text for text, _ in ranked]
