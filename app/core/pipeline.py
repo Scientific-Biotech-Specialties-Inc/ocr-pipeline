@@ -449,17 +449,18 @@ async def _read_and_extract(
                     caller_currency=caller_currency,
                     caller_location=caller_location,
                 )
-                if fast_path_sufficient(baseline):
+                if fast_path_sufficient(baseline) and baseline.fields.get("transaction_date") is not None:
                     await normalize_extraction(baseline, bundle, use_llm=False)
                     return bundle, baseline, t_engine, 0.0
 
-                # Single pass could not reconcile the receipt: escalate to the
+                # Single pass could not reconcile the receipt or date missing: escalate to the
                 # full pool so hard receipts keep the exact pooled accuracy.
                 logger.info(
-                    "Page %s fast path insufficient (reconciled=%s, total=%s); "
+                    "Page %s fast path insufficient (reconciled=%s, total=%s, date=%s); "
                     "escalating to pooled OCR",
                     index, baseline.reconciled,
                     baseline.fields.get("total_amount") is not None,
+                    baseline.fields.get("transaction_date") is not None,
                 )
                 t0_engine = time.perf_counter()
                 bundle = await read_pooled(image, lang="eng", fast_path=False)
@@ -567,6 +568,7 @@ async def _read_and_extract_segments(
     is_sufficient = (
         (baseline.reconciled or (baseline.item_scan and baseline.item_scan.near_reconciled))
         and baseline.fields.get("total_amount") is not None
+        and baseline.fields.get("transaction_date") is not None
     )
 
     if is_sufficient:
@@ -578,21 +580,22 @@ async def _read_and_extract_segments(
     needs_vendor_recovery = (
         baseline.fields.get("vendor_name") is None and baseline.fields.get("vendor_tax_id") is None
     )
-    if (needs_total_recovery or needs_vendor_recovery) and ordered_pairs:
+    needs_date_recovery = baseline.fields.get("transaction_date") is None
+    if (needs_total_recovery or needs_vendor_recovery or needs_date_recovery) and ordered_pairs:
         logger.info(
-            "Multi-segment fast path: targeted recovery triggered (needs_total=%s, needs_vendor=%s)",
-            needs_total_recovery, needs_vendor_recovery,
+            "Multi-segment fast path: targeted recovery triggered (needs_total=%s, needs_vendor=%s, needs_date=%s)",
+            needs_total_recovery, needs_vendor_recovery, needs_date_recovery,
         )
         t0_rec = time.perf_counter()
         recovery_tasks = []
-        if needs_total_recovery:
-            # Bottom 35% of the last segment (where total/subtotal resides)
+        if (needs_total_recovery or needs_date_recovery) and ordered_pairs:
+            # Bottom 35% of the last segment (where total/subtotal/footer-date resides)
             last_img, _ = ordered_pairs[-1]
             recovery_tasks.append(
                 loop.run_in_executor(ocr_executor, read_region_recovery, last_img, 0.65, 1.0, "eng")
             )
-        if needs_vendor_recovery:
-            # Top 30% of the first segment (where vendor/TIN resides)
+        if (needs_vendor_recovery or needs_date_recovery) and ordered_pairs:
+            # Top 30% of the first segment (where vendor/TIN/header-date resides)
             first_img, _ = ordered_pairs[0]
             recovery_tasks.append(
                 loop.run_in_executor(ocr_executor, read_region_recovery, first_img, 0.0, 0.30, "eng")

@@ -48,6 +48,40 @@ class TestGroundingRejection:
         )
         assert result.rejected == {}
 
+    def test_grounded_date_survives(self):
+        result = verify(
+            {"transaction_date": "2025-05-24"},
+            PRINTED_TEXT,
+            reconciled=True,
+            locale_resolved=True,
+            mean_word_confidence=0.9,
+        )
+        assert result.fields["transaction_date"] == "2025-05-24"
+        assert not result.rejected
+
+    def test_ocr_recovered_date_is_grounded(self):
+        result = verify(
+            {"transaction_date": "2026-08-11"},
+            "Store #101\nDate: 08/ll/2026\nTotal: 10.00",
+            reconciled=True,
+            locale_resolved=True,
+            mean_word_confidence=0.9,
+        )
+        assert result.fields["transaction_date"] == "2026-08-11"
+        assert "transaction_date" not in result.rejected
+
+    def test_ungrounded_date_is_rejected(self):
+        result = verify(
+            {"transaction_date": "2024-01-01"},
+            PRINTED_TEXT,
+            reconciled=True,
+            locale_resolved=True,
+            mean_word_confidence=0.9,
+        )
+        assert result.fields["transaction_date"] is None
+        assert "transaction_date" in result.rejected
+        assert REASON_REJECTED in result.reasons
+
 
 class TestUnreconciledMoney:
     def test_misread_tax_figure_is_withheld(self):

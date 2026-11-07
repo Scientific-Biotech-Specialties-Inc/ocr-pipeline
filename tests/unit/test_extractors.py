@@ -104,6 +104,68 @@ class TestDateSelection:
         c2 = find_dates(["Billing Date: 05/24/2025"])[0]
         assert c2.score > 2.0
 
+    def test_numeric_month_first_and_day_first(self):
+        from datetime import date
+        ref_today = date(2026, 12, 31)
+        c_ph = find_dates(["08/11/2026"], country="PH", today=ref_today)[0]
+        assert c_ph.value.isoformat() == "2026-08-11"
+        c_gb = find_dates(["08/11/2026"], country="GB", today=ref_today)[0]
+        assert c_gb.value.isoformat() == "2026-11-08"
+        c_swap = find_dates(["15/11/2026"], country="PH", today=ref_today)[0]
+        assert c_swap.value.isoformat() == "2026-11-15"
+
+    def test_textual_month_formats(self):
+        from datetime import date
+        ref_today = date(2026, 12, 31)
+        assert find_dates(["Date: Nov 11, 2026"], today=ref_today)[0].value.isoformat() == "2026-11-11"
+        assert find_dates(["Date: Nov 11, '26"], today=ref_today)[0].value.isoformat() == "2026-11-11"
+        assert find_dates(["Date: 11-Nov-2026"], today=ref_today)[0].value.isoformat() == "2026-11-11"
+        assert find_dates(["Date: Nov-11-2026"], today=ref_today)[0].value.isoformat() == "2026-11-11"
+        assert find_dates(["Date: 11/Nov/2026"], today=ref_today)[0].value.isoformat() == "2026-11-11"
+        assert find_dates(["Date: 11th of November, 2026"], today=ref_today)[0].value.isoformat() == "2026-11-11"
+
+    def test_adjacent_punctuation_and_time_boundary(self):
+        assert find_dates(["07/31/2026(Fri) 12:47:42"])[0].value.isoformat() == "2026-07-31"
+        assert find_dates(["Str No: 4032 Date:08/06/2026 Time:15:39:47"])[0].value.isoformat() == "2026-08-06"
+        assert find_dates(["2026-07-30T17:54:07"])[0].value.isoformat() == "2026-07-30"
+        assert find_dates(["08 / 11 / 2026"])[0].value.isoformat() == "2026-08-11"
+
+    def test_same_line_expiry_does_not_drop_transaction_date(self):
+        lines = ["03/06/2016 05:25 PM EXPIRES 06/04/16"]
+        candidates = find_dates(lines)
+        valid = [c for c in candidates if c.score > 0]
+        assert len(valid) >= 1
+        assert valid[0].value.isoformat() == "2016-03-06"
+        # 06/04/16 directly follows EXPIRES and must be penalized below zero
+        expiry_candidates = [c for c in candidates if c.value.isoformat() == "2016-06-04"]
+        assert len(expiry_candidates) == 1
+        assert expiry_candidates[0].score < 0
+
+    def test_scoped_ocr_character_recovery(self):
+        assert find_dates(["Date: O8/11/2026"])[0].value.isoformat() == "2026-08-11"
+        assert find_dates(["Date: 08/ll/2026"])[0].value.isoformat() == "2026-08-11"
+        assert find_dates(["Date: 2O26-07-30"])[0].value.isoformat() == "2026-07-30"
+
+    def test_previous_line_label_lookback(self):
+        from datetime import date
+        ref_today = date(2026, 12, 31)
+        lines = ["Transaction Date:", "Nov 11, 2026"]
+        candidates = find_dates(lines, today=ref_today)
+        assert len(candidates) == 1
+        assert candidates[0].value.isoformat() == "2026-11-11"
+        assert candidates[0].score > 2.0
+
+    def test_timezone_day_tolerance(self):
+        from datetime import date
+        today = date(2026, 11, 7)
+        # Next-day PHT date relative to UTC must be accepted
+        res = find_dates(["Date: 11/08/2026"], today=today)
+        assert len(res) == 1
+        assert res[0].value.isoformat() == "2026-11-08"
+        # Dates beyond +1 day rejected as future dates
+        future = find_dates(["Date: 11/15/2026"], today=today)
+        assert future == []
+
 
 class TestInvoiceNumber:
     def test_labelled_invoice_number(self):

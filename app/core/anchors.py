@@ -21,10 +21,10 @@ TAX_ID_RE = re.compile(r"\b\d{3}\s*[-\s]\s*\d{3}\s*[-\s]\s*\d{3}\s*[-\s]\s*\d{3,
 MONEY_RE = re.compile(r"\d{1,3}(?:[,.\s]\d{3})*[,.]\d{2}\b|\b\d+[,.]\d{2}\b")
 
 DATE_RE = re.compile(
-    r"\b\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2,4}\b"
-    r"|\b\d{4}[/\-.]\d{1,2}[/\-.]\d{1,2}\b"
-    r"|\b\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z.]*\s+\d{2,4}\b"
-    r"|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z.]*\s+\d{1,2},?\s+\d{4}\b",
+    r"(?<!\d)\d{1,2}\s*[-/.]\s*\d{1,2}\s*[-/.]\s*['’]?\d{2,4}(?!\d)"
+    r"|(?<!\d)\d{4}\s*[-/.]\s*\d{1,2}\s*[-/.]\s*\d{1,2}(?!\d)"
+    r"|(?<!\d)\d{1,2}(?:st|nd|rd|th)?(?:[\s\-_/]+|[\s\-_/]+of[\s\-_/]+)(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z.]*(?:,\s*|[\s\-_/]+)['’]?\d{2,4}(?!\d)"
+    r"|(?<![A-Za-z0-9])(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z.]*[\s\-_/]+\d{1,2}(?:st|nd|rd|th)?(?:,\s*|[\s\-_/]+)['’]?\d{2,4}(?!\d)",
     re.IGNORECASE,
 )
 

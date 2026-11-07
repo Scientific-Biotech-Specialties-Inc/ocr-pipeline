@@ -48,6 +48,8 @@ def parse_date_value(raw: Any) -> date | None:
     for fmt in (
         "%Y-%m-%d", "%m-%d-%Y", "%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y",
         "%Y/%m/%d", "%b %d, %Y", "%B %d, %Y", "%d %b %y", "%d %b %Y",
+        "%d-%b-%Y", "%d-%b-%y", "%b-%d-%Y", "%b-%d-%y",
+        "%d/%b/%Y", "%d/%b/%y", "%b/%d/%Y", "%b/%d/%y",
     ):
         try:
             return datetime.strptime(text, fmt).date()
@@ -100,6 +102,14 @@ def _money_grounded(value: Any, digit_stream: str) -> bool:
     return any(digits_only(c) in digit_stream for c in candidates if digits_only(c))
 
 
+_OCR_CHAR_MAP = str.maketrans({
+    "O": "0", "o": "0",
+    "I": "1", "l": "1", "|": "1",
+    "S": "5", "s": "5",
+    "B": "8",
+})
+
+
 def _date_appears(value: date, ocr_text: str, digit_stream: str) -> bool:
     year4, year2 = f"{value.year:04d}", f"{value.year % 100:02d}"
     # Both padded and bare forms: receipts print '5/24/2025' as often as
@@ -112,6 +122,11 @@ def _date_appears(value: date, ocr_text: str, digit_stream: str) -> bool:
     renderings |= {f"{y}{m}{d}" for m in months for d in days for y in (year4,)}
     renderings |= {f"{d}{m}{y}" for m in months for d in days for y in (year4, year2)}
     if any(rendering in digit_stream for rendering in renderings):
+        return True
+
+    # Check normalized digit stream for OCR-character recovery (e.g. O->0, l->1)
+    normalized_stream = digits_only(ocr_text.translate(_OCR_CHAR_MAP))
+    if any(rendering in normalized_stream for rendering in renderings):
         return True
 
     lowered = normalize_text(ocr_text)
