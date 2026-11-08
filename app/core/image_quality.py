@@ -74,7 +74,7 @@ def _detect_prominent_face(gray: np.ndarray, max_face_ratio: float = 0.04) -> bo
     else:
         small_gray = gray
 
-    faces = cascade.detectMultiScale(small_gray, scaleFactor=1.1, minNeighbors=4, minSize=(30, 30))
+    faces = cascade.detectMultiScale(small_gray, scaleFactor=1.1, minNeighbors=7, minSize=(30, 30))
     for (x, y, fw, fh) in faces:
         orig_fw = fw / scale
         orig_fh = fh / scale

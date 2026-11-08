@@ -37,7 +37,13 @@ async def test_receipt_21_exclusive_tax_computed_total(bundles):
     assert extraction.fields["total_amount"] == 31.97
     assert extraction.fields["financial_reconciliation_status"] == "reported"
 
-@pytest.mark.parametrize("name", [
+import os
+
+_DEFAULT_SMOKE_RECEIPTS = [
+    "receipt 5.jpg",
+    "receipt 10.png",
+]
+_ALL_RECEIPTS = [
     "receipt 4.jpg",
     "receipt 5.jpg",
     "receipt 9.jpg",
@@ -54,7 +60,12 @@ async def test_receipt_21_exclusive_tax_computed_total(bundles):
     "receipt 19.png",
     "receipt 20.png",
     "receipt 22.jpg",
-])
+]
+
+_SMOKE_RECEIPTS = _ALL_RECEIPTS if os.environ.get("RUN_FULL_RECEIPT_CORPUS") == "true" else _DEFAULT_SMOKE_RECEIPTS
+
+
+@pytest.mark.parametrize("name", _SMOKE_RECEIPTS)
 @pytest.mark.asyncio
 async def test_other_receipts_smoke(bundles, name):
     bundle = await bundles(name)
