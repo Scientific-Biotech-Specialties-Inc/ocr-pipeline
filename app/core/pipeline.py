@@ -462,8 +462,12 @@ async def _read_and_extract(
                                 ocr_executor, read_region_recovery, image, 0.0, 0.30, "eng"
                             )
                             if rec_reading:
-                                bundle.supporting.append(rec_reading)
-                                bundle.all_readings.append(rec_reading)
+                                if isinstance(rec_reading, list):
+                                    bundle.supporting.extend(rec_reading)
+                                    bundle.all_readings.extend(rec_reading)
+                                else:
+                                    bundle.supporting.append(rec_reading)
+                                    bundle.all_readings.append(rec_reading)
                                 baseline = extract(
                                     bundle,
                                     caller_country=caller_country,

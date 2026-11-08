@@ -22,6 +22,7 @@ celery_app.conf.update(
     enable_utc=True,
     task_track_started=True,
     task_time_limit=3600,
+    worker_concurrency=1,
 )
 
 

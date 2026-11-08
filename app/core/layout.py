@@ -253,6 +253,21 @@ def _best_label(line_text: str) -> tuple[str, str] | None:
         for keyword in keywords:
             if keyword == "total" and is_item_product_line:
                 continue
+            if keyword == "disc":
+                # Guard against product names like 'BRAKE DISC' or 'SANDING DISC'
+                # Only recognize as discount when line has discount cues or explicit punctuation/minus
+                has_disc_cue = bool(
+                    re.search(
+                        r"\b(less|%|sc|pwd|osca|snr|senior|student|promo|member|total)\b",
+                        lowered,
+                    )
+                    or ":" in lowered
+                    or "disc." in lowered
+                    or "-" in lowered
+                    or lowered.strip().startswith("disc")
+                )
+                if not has_disc_cue:
+                    continue
             position = lowered.find(keyword)
             if position == -1:
                 continue
