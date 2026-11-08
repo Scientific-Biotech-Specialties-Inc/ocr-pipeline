@@ -161,9 +161,9 @@ def _render_form(spec: ReceiptSpec) -> Image.Image:
     if spec.service_charge:
         canvas.pair(rng.choice(SERVICE_LABELS), _money(spec.service_charge))
 
-    canvas.rule()
-    canvas.pair(rng.choice(TOTAL_LABELS), _money(spec.total_amount), delta=4)
-    canvas.rule()
+    canvas.rule(gap=16)
+    canvas.pair(rng.choice(TOTAL_LABELS), _money(spec.total_amount), delta=4, gap=10)
+    canvas.rule(gap=16)
 
     if not is_vat:
         canvas.line("THIS DOCUMENT IS NOT VALID FOR CLAIMING INPUT TAXES", delta=-5)

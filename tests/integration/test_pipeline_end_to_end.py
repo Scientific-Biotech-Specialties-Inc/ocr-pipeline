@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from app.core import pipeline
+from app.core import ocr_engine, pipeline
 
 RECEIPTS = Path(__file__).resolve().parents[2] / "docs" / "receipts"
 
@@ -63,9 +63,10 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> Harness:
     monkeypatch.setattr(pipeline.MongoDBClient, "update_job_status", fake_update)
     monkeypatch.setattr(pipeline, "send_callback", fake_callback)
     monkeypatch.setattr(pipeline, "_store_embedding", fake_store_embedding)
-    # No Ollama and no sentence-transformers in the test environment; both assists
-    # must degrade to the deterministic result rather than fail the job.
+    # No Ollama, sentence-transformers, or dynamic PaddleOCR model downloads in test environment;
+    # assists must degrade deterministically to the baseline verified by these fixtures.
     monkeypatch.setattr(pipeline, "_embedder", lambda: None)
+    monkeypatch.setattr(ocr_engine, "_get_paddle_ocr", lambda: None)
     return captured
 
 
