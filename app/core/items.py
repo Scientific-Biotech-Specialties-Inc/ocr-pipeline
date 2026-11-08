@@ -31,8 +31,12 @@ from app.core.ocr_engine import Word
 # Lines that introduce the item region. The region may also begin at a printed
 # rule, so a separator counts too.
 REGION_START_PATTERNS = (
-    r"^details$", r"nature\s+of\s+service", r"particulars", r"description",
-    r"\bqty\b", r"unit\s+cost", r"unit\s+price", r"^item", r"^\*{4,}$", r"^-{4,}$",
+    r"^\s*details\b", r"nature\s+of\s+service", r"^\s*particulars\b",
+    r"^\s*description\b", r"^\s*desc\b",
+    r"^\s*qty\b", r"\bunit\s+cost\b", r"\bunit\s+price\b",
+    r"^\s*item(?:s)?\s*(?:desc|name|price|amt|amount|\b|$)",
+    r"^\s*item\s*#",
+    r"^\*{4,}$", r"^-{4,}$", r"^={4,}$",
 )
 _REGION_START_RE = re.compile("|".join(REGION_START_PATTERNS), re.IGNORECASE)
 
@@ -43,25 +47,52 @@ SUMMARY_FIELDS = frozenset({
     "service_charge", "discount_amount", "withholding_tax",
 })
 
-# Footer and payment noise that can carry money tokens.
+# Footer, payment, and promo noise that can carry money tokens.
 ITEM_NOISE_PATTERNS = (
-    r"change\s+due", r"payment", r"\bcash\b", r"\bcard\b", r"tender",
+    r"change\s+due", r"\bpayment\b", r"\bcash\b", r"\bcard\b", r"tender",
     r"authority\s+to\s+print", r"\bocn\b", r"booklets", r"valid\s+until",
-    r"\batp\b", r"vat\s*reg", r"\btin\b", r"balance", r"amount\s+in\s+words",
-    r"total\s+item", r"item\s+sold", r"regular\s+price", r"card\s+savings?",
-    r"card\s+saver", r"mfrcpn", r"cartwheel",
+    r"\batp\b", r"vat\s*reg", r"\btin\b", r"\bbalance\b", r"amount\s+in\s+words",
+    r"tota[l!1i]\s+item", r"item\s+sold", r"re[sg]ular\s+price", r"card\s+savin[gces]*",
+    r"card\s+saver", r"mfrcpn", r"cartwheel", r"you\s+saved",
+    r"carry\s*-?\s*out", r"dine\s*-?\s*in", r"take\s*-?\s*out",
+    r"^\s*amt\b", r"suggested\s+gratuity", r"grat(?:uity)?\s+\d+%",
+    r"^\s*tip\b", r"tax[i]?\s*\+?\s*tip",
 )
 _ITEM_NOISE_RE = re.compile("|".join(ITEM_NOISE_PATTERNS), re.IGNORECASE)
 
-_LEADING_QUANTITY_RE = re.compile(r"^\s*(\d{1,3})\s*(?:[xX×@*]|pc|pcs|pieces)?\s+(?=\S)")
+# Weight breakdown lines like '2.51 lb @ $0.99 /lb'
+_WEIGHT_BREAKDOWN_RE = re.compile(
+    r"\b\d+(?:[.,]\d+)?\s*(?:lb|kg|g|oz|lbs)\s*@\s*[$pP€£¥]?\d+(?:[.,]\d+)?\s*/\s*(?:lb|kg|g|oz|lbs)\b",
+    re.IGNORECASE,
+)
+
+# Header metadata lines (e.g. store address, cashier, phone)
+_HEADER_METADATA_RE = re.compile(
+    r"\b(?:tel|phone|fax|mobile|cel|contact)\b"
+    r"|\b(?:cashier|terminal|register|trans(?:action)?|order|table|check|chk)\s*[:#0-9]"
+    r"|\b(?:str|store)\s*(?:no|#)?\s*[:0-9]"
+    r"|\b(?:date|time)\s*:"
+    r"|\b(?:min|sn|ptu|atp|pn|spm)\s*:"
+    r"|\b(?:vat\s*reg|taxpayer|non\s*vat)\b"
+    r"|\b(?:dine\s*in|take\s*out|drive\s*thru)\b",
+    re.IGNORECASE,
+)
+
+_LEADING_QUANTITY_RE = re.compile(
+    r"^\s*(\d{1,3})\s*(?:[xX×@*]|pc|pcs|pieces|qty)?\s+(?=\S)", re.IGNORECASE
+)
 _UPC_PREFIX_RE = re.compile(r"^\s*(?:\d{8,14}|[A-Za-z0-9]{2,6}\d{7,14})\s+")
-# 'name ... x2', 'name ... 2 @', and the BIR form layout which prints the
-# quantity in its own column immediately left of the amount: 'Bond Paper 2 490.00'.
-# Without this the quantity silently defaults to 1 on every form receipt.
 _TRAILING_QUANTITY_RE = re.compile(
     r"(?:\s+[xX×@*]\s*(\d{1,3})|\s+(\d{1,3})\s*[xX×@*]?)\s*$", re.IGNORECASE
 )
-_TRAILING_TAX_FLAG_RE = re.compile(r"\s+(?:[VTEZ]|NV|VAT)\s*$", re.IGNORECASE)
+_TRAILING_TAX_FLAG_RE = re.compile(
+    r"\s+(?:[VTEZSYN]|NV|VAT)\s*$", re.IGNORECASE
+)
+_INLINE_UNIT_PRICE_RE = re.compile(
+    r"@\s*[pP$€£¥]?\d+(?:[,.]\d{2,3})?(?:\s*/\s*(?:unit|pc|pcs|ea|kg|lb|gal|l)\b)?"
+    r"|[pP$€£¥]?\d+(?:[,.]\d{2,3})?\s*/\s*(?:unit|pc|pcs|ea|kg|lb|gal|l)\b",
+    re.IGNORECASE,
+)
 
 MAX_NAME_LENGTH = 255
 MAX_ITEMS = getattr(settings, "ocr_max_items", 250)
@@ -140,23 +171,36 @@ class ItemScan:
         return rows
 
 
+def parse_items_candidates(lines: list[list[Word]]) -> list[list[ExtractedItem]]:
+    """Return distinct candidate item lists from both marker-required and markerless passes."""
+    cands: list[list[ExtractedItem]] = []
+    seen_signatures: set[tuple] = set()
+
+    for require_marker in (True, False):
+        raw_items = _parse_region(lines, require_marker=require_marker)
+        items = _strip_running_subtotal(raw_items)
+        if items:
+            sig = tuple((it.full_name, it.quantity, it.price) for it in items)
+            if sig not in seen_signatures:
+                seen_signatures.add(sig)
+                cands.append(items)
+
+    return cands or [[]]
+
+
 def parse_items(lines: list[list[Word]]) -> list[ExtractedItem]:
-    """Extract item rows from one OCR reading.
+    """Extract item rows from one OCR reading."""
+    cands = parse_items_candidates(lines)
+    if not cands or not cands[0]:
+        return []
+    if len(cands) == 1:
+        return cands[0]
 
-    Expects a reading that preserves visual rows. Sparse-text segmentation emits
-    the amount column separately from the names - and in reverse order - so a
-    caller must supply a block-layout reading for this to mean anything.
-
-    Tried twice. The first pass requires a region marker ('Details', a column
-    heading, a printed rule); the second drops that requirement, because thermal
-    slips separate the region with a row of asterisks that OCR turns into noise
-    ('AERIS IER EOE Ea Ooo'). The noise filters and the summary-label terminator
-    still bound the region in the second pass.
-    """
-    items = _parse_region(lines, require_marker=True)
-    if not items:
-        items = _parse_region(lines, require_marker=False)
-    return _strip_running_subtotal(items)
+    marker_items, no_marker_items = cands[0], cands[1]
+    # If the marker pass only caught a few late lines near the end while markerless caught a fuller list, prefer markerless
+    if len(no_marker_items) > len(marker_items) and len(marker_items) <= 2:
+        return no_marker_items
+    return marker_items
 
 
 def _strip_running_subtotal(items: list[ExtractedItem]) -> list[ExtractedItem]:
@@ -181,30 +225,41 @@ def _strip_running_subtotal(items: list[ExtractedItem]) -> list[ExtractedItem]:
     return items
 
 
+def _is_header_or_metadata_line(text: str, seen_item: bool) -> bool:
+    if not seen_item:
+        if _HEADER_METADATA_RE.search(text):
+            return True
+        lowered = text.casefold()
+        if any(term in lowered for term in ("st.", "street", "ave.", "avenue", "blvd", "rd.", "road", "city", "brgy")):
+            return True
+    return False
+
+
 def _parse_region(lines: list[list[Word]], require_marker: bool) -> list[ExtractedItem]:
     tokens = _collect_money_tokens(lines)
-    money_by_word = {id(token.word): token.text for token in tokens}
-    # Every word consumed by a money token, so the item name can be rebuilt from
-    # the remaining words. A text replace cannot do this: the reassembled token
-    # '$29,99' does not appear in the raw line '1 Family bundle--10pcs $29 ,99'.
     token_word_ids = {id(word) for token in tokens for word in token.words}
 
     items: list[ExtractedItem] = []
     started = not require_marker
     seen_item = False
-    # A money line whose remainder is not a plausible name (grocery-POS layout:
-    # '64.00 V' / '1 × 64.00' / '4800016522533 DRD PEV-CUT EP025G'). The item is
-    # held until the following lines supply the name, instead of emitting rows
-    # named 'V' and treating the barcode line as a description.
     pending: ExtractedItem | None = None
     pending_qty_prefix: tuple[int, float] | None = None
+    buffered_name: str | None = None
 
     def _flush_pending() -> None:
         nonlocal pending, seen_item
         if pending is not None:
-            items.append(pending)
-            seen_item = True
+            if pending.name and pending.name.strip():
+                items.append(pending)
+                seen_item = True
             pending = None
+
+    def _flush_buffered_to_desc() -> None:
+        nonlocal buffered_name
+        if buffered_name is not None:
+            if items and _plausible_description(buffered_name):
+                items[-1].descriptions.append(buffered_name)
+            buffered_name = None
 
     for line in lines:
         text = " ".join(word.text for word in line).strip()
@@ -214,18 +269,27 @@ def _parse_region(lines: list[list[Word]], require_marker: bool) -> list[Extract
         label = _best_label(text)
         if label and label[0] == "discount_amount":
             _flush_pending()
+            _flush_buffered_to_desc()
             continue
         if label and label[0] in SUMMARY_FIELDS:
-            _flush_pending()
-            if seen_item:
-                break  # the first summary line after the items ends the region
-            # A summary label before any item does NOT open the region. Treating it
-            # as an opener made a footer 'Discount' line start a phantom region, so
-            # 'AnnivDiscount $8.2' and 'Amount $16.0' were returned as the items and
-            # the real rows above were never reached.
-            continue
+            is_summary = True
+            if label[1] in ("total", "net of vat", "subtotal", "tax"):
+                words_in_line = [w for w in text.split() if w.isalnum()]
+                if len(words_in_line) >= 3 and not text.lower().startswith(("subtotal", "total", "tax", "vat")):
+                    is_summary = False
 
-        if not started and _REGION_START_RE.search(text):
+            if is_summary:
+                _flush_pending()
+                _flush_buffered_to_desc()
+                if seen_item:
+                    break
+                continue
+
+        line_word_ids = {id(w) for w in line}
+        line_tokens = [t for t in tokens if any(id(w) in line_word_ids for w in t.words)]
+        money = [t.text for t in line_tokens]
+
+        if not money and not re.search(r"^\s*\d+\s+qty\b", text, re.IGNORECASE) and _REGION_START_RE.search(text):
             started = True
             continue
         if not started:
@@ -233,12 +297,18 @@ def _parse_region(lines: list[list[Word]], require_marker: bool) -> list[Extract
         if _ITEM_NOISE_RE.search(text):
             continue
 
-        money = [money_by_word[id(word)] for word in line if id(word) in money_by_word]
+        if _WEIGHT_BREAKDOWN_RE.search(text):
+            if items:
+                items[-1].descriptions.append(text)
+            continue
 
         if money:
-            remainder = " ".join(
-                word.text for word in line if id(word) not in token_word_ids
-            )
+            chosen_token = line_tokens[-1]
+            words_left = [w for w in line if id(w) not in token_word_ids and w.left < chosen_token.left]
+            words_right = [w for w in line if id(w) not in token_word_ids and w.left >= chosen_token.left + chosen_token.word.width]
+            text_left = " ".join(w.text for w in words_left).strip()
+            remainder = text_left if text_left else " ".join(w.text for w in words_right).strip()
+
             if pending is not None:
                 if _is_quantity_line(remainder):
                     quantity = _quantity_of(remainder)
@@ -255,7 +325,7 @@ def _parse_region(lines: list[list[Word]], require_marker: bool) -> list[Extract
                         pending.price_is_line_total = True
                     continue
 
-            # Check for split-line grocery format where quantity precedes price: '2 x 14.75' or '2 @ 14.75'
+            # Split-line grocery format where quantity precedes price: '2 x 14.75' or '2 @ 14.75'
             qty_price_match = _QUANTITY_LINE_WITH_PRICE_RE.match(text)
             if qty_price_match:
                 q_digits = qty_price_match.group(1).replace("I", "1").replace("l", "1")
@@ -276,15 +346,21 @@ def _parse_region(lines: list[list[Word]], require_marker: bool) -> list[Extract
                     elif abs(u_val - item.price) <= 0.05:
                         item.quantity = q_val
 
+                if not item.name or not looks_like_item_name(item.name) or item.name in ("V", "Y", "T", "E", "Z"):
+                    if buffered_name is not None:
+                        c_name = _clean_name(buffered_name)
+                        if c_name:
+                            item.name = c_name
+                        buffered_name = None
+
                 if looks_like_item_name(item.name):
+                    _flush_buffered_to_desc()
                     items.append(item)
                     seen_item = True
                 else:
                     pending = item
             continue
 
-        # No money on this line: a description of the item above it - unless a
-        # pending item is waiting for its name, which this line supplies.
         if pending is not None:
             name = _clean_name(text)
             if name:
@@ -292,13 +368,21 @@ def _parse_region(lines: list[list[Word]], require_marker: bool) -> list[Extract
             _flush_pending()
             continue
 
-        if items and _plausible_description(text):
-            items[-1].descriptions.append(text)
+        if _is_header_or_metadata_line(text, seen_item):
+            continue
+
+        if not seen_item:
+            buffered_name = text
+            continue
+
+        _flush_buffered_to_desc()
+        buffered_name = text
 
         if len(items) >= MAX_ITEMS:
             break
 
     _flush_pending()
+    _flush_buffered_to_desc()
     return items
 
 
@@ -343,32 +427,39 @@ def _build_item(
             if 1 <= rounded_ratio <= 999 and abs(rounded_ratio * prev_price - price) <= 0.05:
                 inferred_qty = int(rounded_ratio)
 
-    # Strip trailing POS VAT flag ('Burger 2 @ V' -> 'Burger 2 @') only when real words precede it
     stripped_rem = _TRAILING_TAX_FLAG_RE.sub("", remainder).strip()
     if stripped_rem and any(ch.isalpha() for ch in stripped_rem):
         remainder = stripped_rem
 
-    match = _LEADING_QUANTITY_RE.match(remainder)
-    if match:
-        quantity = max(1, int(match.group(1)))
-        remainder = remainder[match.end():]
+    unit_mult_match = re.search(
+        r"^\s*(\d{1,3})\s*[xX×@*]\s*(?:[pP$€£¥]?\d+(?:[,.]\d{2,3})?(?:\s*/\s*\w+)?)\s*$",
+        remainder,
+    )
+    if unit_mult_match:
+        quantity = max(1, int(unit_mult_match.group(1)))
+        remainder = ""
     else:
-        trailing = _TRAILING_QUANTITY_RE.search(remainder)
-        if trailing:
-            digits = trailing.group(1) or trailing.group(2)
-            quantity = max(1, int(digits))
-            remainder = remainder[: trailing.start()]
-        elif inferred_qty is not None:
-            quantity = inferred_qty
+        remainder = _INLINE_UNIT_PRICE_RE.sub("", remainder).strip()
+
+        match = _LEADING_QUANTITY_RE.match(remainder)
+        if match:
+            quantity = max(1, int(match.group(1)))
+            remainder = remainder[match.end():]
+        else:
+            trailing = _TRAILING_QUANTITY_RE.search(remainder)
+            if trailing:
+                digits = trailing.group(1) or trailing.group(2)
+                quantity = max(1, int(digits))
+                remainder = remainder[: trailing.start()]
+            elif inferred_qty is not None:
+                quantity = inferred_qty
 
     price_is_line_total = bool(inferred_qty is not None and inferred_qty == quantity)
 
     name = _clean_name(remainder)
     if not name and inferred_qty is not None:
-        # Handle '2 x 14.75 29.50 V' where the name sits on the following barcode line
         name = "V"
-    if not name:
-        return None
+
     return ExtractedItem(
         name=name,
         quantity=quantity,
@@ -379,19 +470,10 @@ def _build_item(
 
 
 def _clean_name(text: str) -> str:
-    """Tidy the remaining words of an item line into a name.
-
-    Deliberately keeps unreadable text rather than discarding the row: quality is
-    judged later by ``full_name``, which substitutes a placeholder. Dropping the
-    row here would break the item sum and cost the whole list.
-
-    A remainder with no letters at all is rejected, because a bare amount with no
-    accompanying text is a summary figure rather than a product line.
-    """
     cleaned = re.sub(r"[|_]+", " ", text)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" .,:;-*\\/@")
     cleaned = _UPC_PREFIX_RE.sub("", cleaned).strip(" .,:;-*\\/@")
-    # Strip trailing POS VAT flag ('Burger V' -> 'Burger') only when a real name precedes it
+    cleaned = _INLINE_UNIT_PRICE_RE.sub("", cleaned).strip(" .,:;-*\\/@")
     stripped_flag = _TRAILING_TAX_FLAG_RE.sub("", cleaned).strip(" .,:;-*\\/@")
     if stripped_flag and any(ch.isalpha() for ch in stripped_flag):
         cleaned = stripped_flag
@@ -400,38 +482,38 @@ def _clean_name(text: str) -> str:
     return cleaned[:MAX_NAME_LENGTH]
 
 
-def looks_like_item_name(text: str) -> bool:
-    """Is this a plausible product name?
+_ITEM_NAME_BLACKLIST = frozenset({
+    "AMT", "TAX", "SUB", "TOT", "QTY", "POS", "CHK", "TAB", "BAL", "FOR", "AND", "THE",
+})
 
-    Deliberately laxer than the vendor-name test. That one requires two
-    word-shaped tokens because receipt headers are surrounded by OCR debris, but
-    real menu lines are frequently a single short word - 'SALAD', 'SODA', 'FRIES'.
-    Reusing the stricter rule replaced perfectly good names with a placeholder.
-    """
+
+def looks_like_item_name(text: str) -> bool:
+    """Is this a plausible product name?"""
     stripped = text.strip()
     letters = sum(1 for ch in stripped if ch.isalpha())
     if letters < 3:
         return False
-    if letters < len(stripped) * 0.5:
+    if letters < len(stripped) * 0.35:
         return False
 
     tokens = re.findall(r"[A-Za-z][A-Za-z.'&/-]*", stripped)
     solid = [token for token in tokens if len(token) >= 3]
     if not solid:
         return False
-    # One word is enough if it is a real word length ('SALAD', 'SODA'), but a lone
-    # three-letter fragment among noise is not - 'ci cr } UM SDR \' would otherwise
-    # pass on the strength of 'SDR'.
-    if len(solid) == 1 and len(solid[0]) < 4:
-        return False
-    # Noise alternates case mid-word; product names are caps or title case.
-    odd = sum(1 for token in solid if re.search(r"[a-z][A-Z]", token))
-    return odd <= len(solid) * 0.5
+
+    if len(solid) == 1 and len(solid[0]) == 3:
+        if len(tokens) > 2 or solid[0].upper() in _ITEM_NAME_BLACKLIST:
+            return False
+
+    multi_odd = sum(
+        1 for token in solid if len(re.findall(r"[a-z][A-Z]", token)) >= 2
+    )
+    return multi_odd == 0
 
 
 def _plausible_description(text: str) -> bool:
     letters = sum(1 for ch in text if ch.isalpha())
-    return letters >= 3 and letters >= len(text) * 0.4
+    return letters >= 3 and letters >= len(text) * 0.35
 
 
 def looks_like_store_code(name: str) -> bool:

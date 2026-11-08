@@ -176,13 +176,65 @@ def read_variant(image: Image.Image, psm: int, lang: str = "eng") -> OcrReading:
     return reading
 
 
+_VALUE_COLUMN_RE = re.compile(
+    r"\d{1,3}(?:[,.\s]\d{3})*[.,]\d{1,2}\b"  # money
+    r"|\b\d{1,4}[-/.]\d{1,2}[-/.]\d{1,4}\b"  # date
+    r"|\b\d{1,3}\s*[xX×@*]\b"  # qty
+    r"|\b[pP$€£¥]?\d+[.,]\d{2}\b"  # currency amount
+    r"|\b\d+%\b"  # percentage
+    r"|^\s*[VTEZSYNXA0-9]\s*$",  # tax code or single flag
+    re.IGNORECASE,
+)
+
+
 def group_lines(words: Sequence[Word]) -> list[list[Word]]:
-    """Group words into visual lines, ordered left to right."""
+    """Group words into visual lines, ordered left to right.
+
+    PaddleOCR often assigns separate line IDs to left-aligned text and right-aligned
+    prices on the same visual horizontal row. This merges horizontally split fragments
+    sharing vertical overlap into unified visual lines while preserving two-column
+    form separation.
+    """
     buckets: dict[tuple[int, int, int], list[Word]] = {}
     for word in words:
         buckets.setdefault(word.line_key, []).append(word)
-    lines = [sorted(group, key=lambda w: w.left) for group in buckets.values()]
-    return sorted(lines, key=lambda group: (group[0].top, group[0].left))
+    raw_lines = [sorted(group, key=lambda w: w.left) for group in buckets.values()]
+    sorted_lines = sorted(raw_lines, key=lambda group: (group[0].top, group[0].left))
+
+    if len(sorted_lines) <= 1:
+        return sorted_lines
+
+    merged_lines: list[list[Word]] = []
+    for group in sorted_lines:
+        if not merged_lines:
+            merged_lines.append(group)
+            continue
+
+        prev = merged_lines[-1]
+        prev_center_y = sum(w.center_y for w in prev) / len(prev)
+        prev_h = max(w.height for w in prev)
+        prev_right = max(w.right for w in prev)
+
+        curr_center_y = sum(w.center_y for w in group) / len(group)
+        curr_h = max(w.height for w in group)
+        curr_left = min(w.left for w in group)
+
+        max_h = max(prev_h, curr_h, 8)
+        min_h = min(prev_h, curr_h, 8)
+        y_overlap = abs(prev_center_y - curr_center_y) <= 0.55 * max_h
+        ordered_horiz = curr_left >= prev_right - (0.5 * min_h)
+
+        if y_overlap and ordered_horiz:
+            gap = curr_left - prev_right
+            curr_text = " ".join(w.text for w in group)
+            # Merge if gap is small (adjacent words in sentence), or if right group is a value/amount column
+            if gap <= 3.5 * max_h or _VALUE_COLUMN_RE.search(curr_text):
+                merged_lines[-1] = sorted(prev + group, key=lambda w: w.left)
+                continue
+
+        merged_lines.append(group)
+
+    return merged_lines
 
 
 def _render_text(words: Sequence[Word]) -> str:

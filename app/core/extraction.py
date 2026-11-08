@@ -29,7 +29,7 @@ from app.core.extractors import (
     text_lines,
 )
 from app.core.financial_semantics import FinancialSemantics, infer_tax_basis
-from app.core.items import ItemScan, parse_items, reconcile_items
+from app.core.items import ItemScan, parse_items_candidates, reconcile_items
 from app.core.layout import LayoutScan, classify_discount_type, scan_layout
 from app.core.locale import LocaleGuess, resolve_locale
 from app.core.ocr_engine import OcrBundle
@@ -308,23 +308,32 @@ def _best_items(bundle: OcrBundle, money: MoneyResult, tax_basis: str = "unknown
     if discount > 0 and money.get("net_sales") is not None:
         targets["net_sales_plus_discount"] = round((money.get("net_sales") or 0.0) + discount, 2)
 
+    valid_readings = [
+        r for r in bundle.all_readings if not getattr(r, "variant", "").startswith("region_")
+    ]
+    readings_to_check = valid_readings or bundle.all_readings
+
     best: ItemScan | None = None
-    for reading in bundle.all_readings:
-        scan = reconcile_items(parse_items(reading.lines), targets)
-        rank = (
-            1 if scan.reconciled else 0,
-            1 if scan.near_reconciled else 0,
-            scan.count,
-        )
-        best_rank = (
-            (1 if best.reconciled else 0, 1 if best.near_reconciled else 0, best.count)
-            if best is not None
-            else (-1, -1, -1)
-        )
-        if best is None or rank > best_rank:
-            best = scan
-        if scan.reconciled:
-            break  # an arithmetically consistent reading is good enough
+    for reading in readings_to_check:
+        candidates = parse_items_candidates(reading.lines)
+        for cand_items in candidates:
+            scan = reconcile_items(cand_items, targets)
+            rank = (
+                1 if scan.reconciled else 0,
+                1 if scan.near_reconciled else 0,
+                scan.count,
+            )
+            best_rank = (
+                (1 if best.reconciled else 0, 1 if best.near_reconciled else 0, best.count)
+                if best is not None
+                else (-1, -1, -1)
+            )
+            if best is None or rank > best_rank:
+                best = scan
+            if scan.reconciled:
+                break
+        if best and best.reconciled:
+            break
 
     return best or ItemScan()
 
@@ -342,7 +351,10 @@ def _best_layout(
     """
     best: tuple[tuple[int, int, int], LayoutScan, MoneyResult] | None = None
 
-    for reading in bundle.all_readings:
+    full_readings = [
+        r for r in bundle.all_readings if not getattr(r, "variant", "").startswith("region_")
+    ]
+    for reading in (full_readings or bundle.all_readings):
         scan = scan_layout(reading.lines)
         money = resolve_money(scan, locale, vat_registered, tax_basis)
         rank = (
@@ -352,6 +364,22 @@ def _best_layout(
         )
         if best is None or rank > best[0]:
             best = (rank, scan, money)
+
+    # Only inspect partial region recovery readings if full readings failed to reconcile or missed total
+    if best is not None and (not best[2].reconciled or best[2].get("total_amount") is None):
+        region_readings = [
+            r for r in bundle.all_readings if getattr(r, "variant", "").startswith("region_")
+        ]
+        for reading in region_readings:
+            scan = scan_layout(reading.lines)
+            money = resolve_money(scan, locale, vat_registered, tax_basis)
+            rank = (
+                1 if money.reconciled else 0,
+                scan.label_count,
+                1 if money.get("total_amount") is not None else 0,
+            )
+            if rank > best[0]:
+                best = (rank, scan, money)
 
     if best is None:  # pragma: no cover - bundle always has a primary
         empty = LayoutScan()
