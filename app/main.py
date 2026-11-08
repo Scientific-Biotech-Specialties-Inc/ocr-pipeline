@@ -8,9 +8,27 @@ from app.config import settings
 from app.db.mongodb import MongoDBClient
 
 
+import asyncio
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def _run_migrations():
+    try:
+        from alembic.config import Config
+        from alembic import command
+        alembic_cfg = Config("alembic.ini")
+        command.upgrade(alembic_cfg, "head")
+        logger.info("Alembic database migrations applied successfully.")
+    except Exception as exc:
+        logger.warning("Alembic migration skipped or failed: %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     MongoDBClient.connect()
+    await asyncio.to_thread(_run_migrations)
     yield
     MongoDBClient.close()
     await rate_limit_backend.close()

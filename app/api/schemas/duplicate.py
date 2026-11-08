@@ -1,9 +1,9 @@
+from typing import List, Optional
 from pydantic import BaseModel
-from typing import List
 
 class DuplicateCheckRequest(BaseModel):
     receipt_text: str
-    source_service: str
+    source_service: Optional[str] = None
     threshold: float = 0.85
     days_window: int = 90
 

@@ -8,7 +8,7 @@ from PIL import Image
 
 from app.core.image_quality import check_image_quality
 
-RECEIPTS_DIR = Path(__file__).resolve().parents[1] / "docs" / "receipts"
+RECEIPTS_DIR = Path(__file__).resolve().parents[2] / "docs" / "receipts"
 
 
 def create_test_image(width: int = 400, height: int = 600, color: int = 200) -> Image.Image:
@@ -101,5 +101,3 @@ def test_receipt_15_orange_table_passes_quality_gate():
         return
     result = check_image_quality(Image.open(path))
     assert result.passed is True, result.rejection_reason
-
-

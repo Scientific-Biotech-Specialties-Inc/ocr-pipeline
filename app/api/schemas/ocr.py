@@ -3,6 +3,7 @@ from typing import Any, Optional, List
 from pydantic import BaseModel, Field, field_validator
 
 from app.core.financial_semantics import normalize_iso_currency
+from app.core.schema import EXPENSE_CATEGORIES
 from app.core.verification import coerce_category
 
 # ISO 4217 codes the pipeline and SERMS both understand.

@@ -19,9 +19,10 @@ from app.core import pipeline
 
 RECEIPTS = Path(__file__).resolve().parents[2] / "docs" / "receipts"
 
-pytestmark = pytest.mark.skipif(
-    not RECEIPTS.exists(), reason="sample receipts not available"
-)
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.skipif(not RECEIPTS.exists(), reason="sample receipts not available"),
+]
 
 
 class Harness:
