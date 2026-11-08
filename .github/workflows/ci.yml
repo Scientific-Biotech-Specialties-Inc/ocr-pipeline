@@ -35,7 +35,18 @@ jobs:
     name: Unit Tests
     needs: lint
     runs-on: ubuntu-latest
+    env:
+      APP_ENV: testing
+      SERMS_API_KEY: test-serms-key
+      PRS_API_KEY: test-prs-key
+      CALLBACK_API_KEY: test-callback-key
+      REDIS_URL: redis://localhost:6379/0
+      MONGODB_URL: mongodb://localhost:27017
+      MONGODB_DATABASE: ocr_pipeline_test
+      POSTGRES_URL: postgresql+asyncpg://ocr_user:secret@localhost:5432/ocr_pipeline
+      OLLAMA_BASE_URL: http://localhost:11434
     steps:
+
       - uses: actions/checkout@v4
 
       - name: Set up Python
