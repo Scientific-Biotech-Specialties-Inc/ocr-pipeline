@@ -162,7 +162,7 @@ def _fill_gaps(
         result.values["total_sales"] = total_sales
         result.derived.add("total_sales")
         result.derivations.add("sales_from_net_tax")
-        result.evidence["total_sales"] = f"derived: inclusive gross from printed net and tax"
+        result.evidence["total_sales"] = "derived: inclusive gross from printed net and tax"
 
     # Only an exclusive receipt with independently printed net/subtotal and tax
     # can authorize a computed callback total. Unknown semantics never substitute.

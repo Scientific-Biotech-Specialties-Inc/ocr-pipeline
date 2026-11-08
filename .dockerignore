@@ -1,0 +1,7 @@
+.git
+.env*
+.pytest_cache
+.ruff_cache
+.eval_out
+__pycache__
+*.pyc

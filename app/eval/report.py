@@ -55,7 +55,7 @@ def render_recoverability(rows: Iterable[RecoverabilityRow], variant_label: str)
     rows = list(rows)
     lines = [
         "",
-        f"RECOVERABILITY  --  is the correct answer even present in the OCR text?",
+        "RECOVERABILITY  --  is the correct answer even present in the OCR text?",
         f"variant: {variant_label}",
         "",
         f"{'receipt':<16}{'type':<20}{'recoverable':>12}   {'':<4}",

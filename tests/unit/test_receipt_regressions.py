@@ -6,7 +6,6 @@ from app.core.extraction import extract
 
 RECEIPTS = Path(__file__).parents[2] / "docs" / "receipts"
 
-import pytest_asyncio
 
 @pytest.fixture(scope="session")
 def bundles():

@@ -67,16 +67,36 @@ docker compose down -v
 
 ---
 
-## 4. Running Automated Tests
-The testing framework uses `pytest` and `pytest-asyncio` inside the containerized API service to mock HTTP requests, Celery tasks, and database mutations.
+## 4. Running Automated Tests & Linting
+The testing framework uses `pytest`, `pytest-asyncio`, and `ruff`.
 
-To execute the test suite:
+### Linting & Static Analysis
 ```powershell
+ruff check .
+```
+
+### Running Test Tiers Inside Docker
+```powershell
+# Unit tests (mocked dependencies)
+docker compose exec api pytest tests/unit/ -v
+
+# Integration tests (live pgvector, MongoDB, Redis)
+docker compose exec api pytest tests/integration/ -v -m integration
+
+# End-to-End tests (full microservice lifecycle)
+docker compose exec api pytest tests/e2e/ -v -m e2e
+
+# All automated tests
 docker compose exec api pytest
 ```
-To run tests with detailed verbosity:
+
+### Running Locally (without Docker)
 ```powershell
-docker compose exec api pytest -v
+# Unit test suite runs without containers
+pytest tests/unit/ -v
+
+# E2E test suite with built-in mock server
+pytest tests/e2e/ -v -m e2e
 ```
 
 ---

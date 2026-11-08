@@ -1,4 +1,4 @@
-from sqlalchemy import select, func, text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import ReceiptEmbedding
 from datetime import datetime, timedelta, timezone

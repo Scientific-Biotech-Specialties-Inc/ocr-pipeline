@@ -194,11 +194,13 @@ Whenever the `!skill` command is used, or if the user's prompt aligns with the u
 
 ## QA & testing
 
-- **Unit tests:** `pytest` + `pytest-asyncio` under `tests/unit/`. All external deps (Ollama, MongoDB, Redis, PostgreSQL) mocked — no live containers required.
+- **Unit tests:** `pytest tests/unit/ -v`. All external deps (Ollama, MongoDB, Redis, PostgreSQL) mocked — no live containers required.
+- **Integration tests:** `pytest tests/integration/ -v -m integration`. Runs against live service containers (`pgvector`, `mongo:7`, `redis:alpine`) and verifies Alembic migrations, pgvector similarity, and real OCR pipeline.
+- **End-to-End tests:** `pytest tests/e2e/ -v -m e2e`. Full asynchronous microservice lifecycle (FastAPI $\to$ Celery worker $\to$ OCR $\to$ mock Ollama $\to$ webhook callback $\to$ duplicate check).
 - **Static analysis:** `ruff check .` (lint); `mypy` (type-checking, if configured).
+- **CI/CD Pipeline (`.github/workflows/ci.yml`):** Runs `lint`, `unit`, `integration`, and `e2e` jobs on all PRs and pushes to `main`. Azure deployment (`deploy.yml`) is strictly gated on CI success.
 - **Manual / exploratory:** Postman against `http://localhost:8010` with a valid Bearer token.
 - **Real receipt images:** `docs/receipts/` contains ~30 sample receipt images (jpg/png). Use these as reference for manual testing, validating OCR accuracy, and reproducing extraction issues against real images. These are for local/manual reference only — never add them to `tests/fixtures/` (see fixture policy below).
-- **CI gate:** PRs must not break `pytest` or introduce new lint errors.
 - **Fixture data policy:** Synthetic only — no real receipt images or customer PII in `tests/fixtures/`.
 
 Key test scenarios: see [`docs/QAD.md`](QAD.md) for H-01 – H-06 (happy paths), S-01 – S-07 (error paths), AB-01 – AB-04 (adversarial/abuse paths).
@@ -207,8 +209,11 @@ Key test scenarios: see [`docs/QAD.md`](QAD.md) for H-01 – H-06 (happy paths),
 
 ## Definition of Done
 
-- `pytest` passes (zero failures).
+- `pytest tests/unit/` passes (zero failures).
+- `pytest tests/integration/ -m integration` passes.
+- `pytest tests/e2e/ -m e2e` passes.
 - `ruff check .` passes (zero new lint errors).
+- CI workflow (`.github/workflows/ci.yml`) passes completely.
 - Docker containers build and start successfully (`docker compose up --build`).
 - `alembic upgrade head` applies cleanly.
 - H-01 through H-06 happy paths verified against live local stack.

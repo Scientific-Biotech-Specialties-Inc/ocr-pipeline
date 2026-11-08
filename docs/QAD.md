@@ -31,13 +31,19 @@
 
 **Testing levels:**
 
-| Level | Tooling | Owner |
-|---|---|---|
-| Unit tests | `pytest` + `pytest-asyncio` | Developer |
-| Static analysis | `ruff` / `mypy` (if configured) | Developer |
-| Manual API testing | Postman / `httpx` against live stack | Developer / QA |
+| Level | Tooling | Environment | Path | Owner |
+|---|---|---|---|---|
+| Lint & Static analysis | `ruff` | Local / GitHub Actions | Root | Developer |
+| Unit tests | `pytest` + `pytest-asyncio` | Mocked (no live containers) | `tests/unit/` | Developer |
+| Integration tests | `pytest` + live containers (`pgvector`, `mongo:7`, `redis:alpine`) | Local Docker / GitHub Actions `services:` | `tests/integration/` | Developer / QA |
+| End-to-End tests | `pytest` + full microservice flow + mock Ollama & Webhook | Local / GitHub Actions `services:` | `tests/e2e/` | Developer / QA |
+| Live LLM tests | Opt-in live `qwen3:1.7b` via `RUN_LIVE_LLM=1` | Local Docker (`ocr_ollama`) | `tests/live/` | Developer / AI Lead |
+| Manual API testing | Postman / `httpx` against live stack | Docker Compose (`http://localhost:8010`) | Local | Developer / QA |
 
-**Mocking strategy:** All external dependencies (Ollama, MongoDB, Redis, PostgreSQL) are **mocked** in unit tests using `unittest.mock` / `pytest-mock`. No live containers are required to run the test suite. Tests live under `tests/unit/`.
+**Mocking & Isolation strategy:**
+- **Unit tests (`tests/unit/`):** All external dependencies (Ollama, MongoDB, Redis, PostgreSQL) are **mocked** using `unittest.mock` / `pytest-mock`. No live containers required.
+- **Integration tests (`tests/integration/`):** PostgreSQL `pgvector`, MongoDB, and Redis run as live containers. Verifies Alembic migrations, pgvector cosine search, MongoDB job states, Redis caching, and real OpenCV/PaddleOCR/Tesseract engine passes.
+- **End-to-End tests (`tests/e2e/`):** Runs the full asynchronous receipt lifecycle (HTTP ingestion $\to$ Celery task execution $\to$ OCR $\to$ Mock Ollama $\to$ Webhook callback $\to$ Duplicate detection) using a self-contained in-memory fixture server for receipts, callbacks, and deterministic LLM responses.
 
 ---
 
@@ -114,17 +120,31 @@
 ### Automated (run on every PR)
 
 ```bash
-# Static type / lint check
-ruff check .          # (if configured)
+# 1. Static type / lint check
+ruff check .
 
-# Unit test suite — no Docker required, all deps mocked
+# 2. Unit test suite — no Docker required, all deps mocked
 pytest tests/unit/ -v
 
-# Verify Alembic migrations are consistent
+# 3. Integration test suite — live pgvector, mongodb, redis containers
+pytest tests/integration/ -v -m integration
+
+# 4. End-to-End test suite — full pipeline + mock Ollama & Webhook
+pytest tests/e2e/ -v -m e2e
+
+# 5. Verify Alembic migrations
 alembic check
+alembic upgrade head
 ```
 
-**CI gate:** PRs must not break the `pytest` suite or introduce new lint errors.
+**CI/CD Pipeline (`.github/workflows/ci.yml`):**
+Runs on every PR and push to `main`:
+1. `lint`: `ruff check .`
+2. `unit`: `pytest tests/unit/ -v`
+3. `integration`: Runs against GitHub Actions service containers (`pgvector/pgvector:pg16`, `mongo:7`, `redis:alpine`) with real OCR packages (`tesseract-ocr`, `poppler-utils`).
+4. `e2e`: Runs full asynchronous flow test suite against service containers + mock Ollama fixture server.
+
+Azure Container Apps deployment (`.github/workflows/deploy.yml`) is strictly gated on the CI workflow passing.
 
 Fast-path and consolidated-assist behavior is covered by unit tests: `tests/unit/test_fast_path.py` (sufficiency gate), `tests/unit/test_ocr_engine.py` (early-exit, fallback pass, escalation, fail-soft), `tests/unit/test_postprocessing.py` (`use_llm=False` dictionary-only normalization), `tests/unit/test_extractors.py` (semicolon/comma invoice separators), `tests/unit/test_locale.py` (`Sdn. Bhd.` not currency), `tests/unit/test_financial_semantics.py` (MY SST/GST exclusive fallback). No live containers required.
 
