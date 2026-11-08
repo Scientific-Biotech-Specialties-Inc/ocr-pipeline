@@ -57,7 +57,9 @@ jobs:
             tesseract-ocr-osd \
             libgl1 \
             libglib2.0-0 \
-            poppler-utils
+            poppler-utils \
+            fonts-dejavu-core \
+            fonts-liberation
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -128,7 +130,9 @@ jobs:
             tesseract-ocr-osd \
             libgl1 \
             libglib2.0-0 \
-            poppler-utils
+            poppler-utils \
+            fonts-dejavu-core \
+            fonts-liberation
 
       - name: Set up Python
         uses: actions/setup-python@v5

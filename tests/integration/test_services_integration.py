@@ -97,7 +97,7 @@ async def test_postgres_pgvector_lifecycle():
             days_window=90,
         )
         assert len(matches) >= 1
-        assert any(m["receipt_id"] == receipt_id for m in matches)
+        assert any(m.receipt_id == receipt_id for m in matches)
 
     # Test deletion via API endpoint
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:

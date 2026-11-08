@@ -41,7 +41,8 @@ SERVICE_LABELS = ("Service Charge", "Svc Charge", "Service Chg")
 
 
 def load_font(name: str, size: int) -> ImageFont.FreeTypeFont:
-    for candidate in FONT_FALLBACKS.get(name, ("arial.ttf",)):
+    candidates = FONT_FALLBACKS.get(name, ("arial.ttf",))
+    for candidate in candidates:
         for directory in FONT_DIRECTORIES:
             path = directory / candidate
             if path.exists():
@@ -49,6 +50,11 @@ def load_font(name: str, size: int) -> ImageFont.FreeTypeFont:
                     return ImageFont.truetype(str(path), size)
                 except OSError:
                     continue
+    for candidate in candidates:
+        try:
+            return ImageFont.truetype(candidate, size)
+        except OSError:
+            continue
     try:
         return ImageFont.load_default(size=size)
     except TypeError:  # Pillow < 10.1
