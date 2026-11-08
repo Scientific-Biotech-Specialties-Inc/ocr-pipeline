@@ -3,6 +3,11 @@ name = "ocr-pipeline"
 version = "1.0.0"
 description = "AI OCR Pipeline for SERMS"
 requires-python = ">=3.12"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+
 dependencies = [
     "fastapi>=0.111.0",
     "uvicorn>=0.30.1",
