@@ -13,7 +13,7 @@ Before setting up the project, make sure you have the following installed on you
 
 ## 2. Dev Environment Setup & Commands
 
-All development services (FastAPI, Redis, Celery, MongoDB, PostgreSQL, and Ollama) are configured via the root `docker-compose.yml` file.
+All development services (FastAPI, Redis, Celery, MongoDB, and PostgreSQL) are configured via the root `docker-compose.yml` file. LLM extraction is served via Google AI Studio (`gemini-2.0-flash`).
 
 ### Step 1: Clone and Configure Environment Variables
 Copy the example environment file to `.env.local` to enable local overrides (note that the application loads `.env` by default, but local overrides should be placed here):

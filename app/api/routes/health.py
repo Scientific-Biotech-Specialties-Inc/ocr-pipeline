@@ -5,11 +5,11 @@ router = APIRouter(prefix="/api", tags=["Health"])
 
 @router.get("/health", response_model=HealthResponse)
 async def health_check():
-    # TODO: Add actual checks for Ollama, Redis, MongoDB, PostgreSQL
+    # TODO: Add actual checks for Gemini, Redis, MongoDB, PostgreSQL
     return HealthResponse(
         status="healthy",
         dependencies={
-            "ollama": "healthy",
+            "gemini": "healthy",
             "redis": "healthy",
             "mongodb": "healthy",
             "postgresql": "healthy"

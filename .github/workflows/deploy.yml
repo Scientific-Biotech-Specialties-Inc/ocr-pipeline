@@ -1,6 +1,6 @@
 name: deploy-ocr
 
-# Builds the OCR images (api/worker + local ollama) and deploys them to Azure
+# Builds the OCR image (api/worker) and deploys to Azure
 # Container Apps. Requires the infra repo to have been deployed first.
 #
 # Repo secrets: AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID (OIDC).
@@ -55,18 +55,6 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Build and push ocr-ollama
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: Dockerfile.ollama
-          push: true
-          tags: |
-            ${{ env.REGISTRY_ORG }}/ocr-ollama:${{ env.IMAGE_TAG }}
-            ${{ env.REGISTRY_ORG }}/ocr-ollama:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
       - name: Azure login (OIDC)
         uses: azure/login@v2
         with:
@@ -79,6 +67,3 @@ jobs:
 
       - name: Roll ocr-worker
         run: az containerapp update -n ocr-worker -g "${{ env.RG }}" --image ${{ env.REGISTRY_ORG }}/ocr-api:${{ env.IMAGE_TAG }}
-
-      - name: Roll ocr-ollama
-        run: az containerapp update -n ocr-ollama -g "${{ env.RG }}" --image ${{ env.REGISTRY_ORG }}/ocr-ollama:${{ env.IMAGE_TAG }}

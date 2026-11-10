@@ -36,7 +36,7 @@ include = ["app*"]
 [tool.pytest.ini_options]
 pythonpath = ["."]
 markers = [
-    "live_llm: opt-in tests requiring a reachable Ollama service",
+    "live_llm: opt-in tests requiring reachable Google AI Studio (Gemini) API",
     "integration: tests requiring backing services or full pipeline wiring",
     "e2e: full stack asynchronous lifecycle tests",
 ]

@@ -58,7 +58,9 @@ def _evidence_list(value: Any) -> tuple[str, ...]:
     return ()
 
 
-def validate_financial_semantics(raw: Any, ocr_text: str = "") -> FinancialSemantics | None:
+def validate_financial_semantics(
+    raw: Any, ocr_text: str = "", *, source: str = "gemini"
+) -> FinancialSemantics | None:
     """Validate a provider response and reject guesses or unusable evidence."""
     if not isinstance(raw, dict):
         return None
@@ -86,10 +88,11 @@ def validate_financial_semantics(raw: Any, ocr_text: str = "") -> FinancialSeman
         basis, confidence, evidence = UNKNOWN, 0.0, ()
     if currency != UNKNOWN and (currency_confidence < 0.75 or not grounded(currency_evidence)):
         currency, currency_confidence, currency_evidence = UNKNOWN, 0.0, ()
+    resolved_source = source if raw else "none"
     return FinancialSemantics(
         tax_basis=basis, confidence=max(0.0, min(confidence, 1.0)), evidence=evidence,
         currency=currency, currency_confidence=max(0.0, min(currency_confidence, 1.0)),
-        currency_evidence=currency_evidence, source="qwen" if raw else "none",
+        currency_evidence=currency_evidence, source=resolved_source,
     )
 
 

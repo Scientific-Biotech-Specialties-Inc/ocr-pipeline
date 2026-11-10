@@ -20,6 +20,16 @@ def test_compute_content_hash():
     assert len(h1) == 64
     assert h1 != h3
 
+    h_gemini = compute_content_hash(
+        [b1, b2], country="PH", currency="PHP", location="Manila", llm_provider="gemini"
+    )
+    assert h1 == h_gemini
+
+    h_other = compute_content_hash(
+        [b1, b2], country="PH", currency="PHP", location="Manila", llm_provider="other_provider"
+    )
+    assert h1 != h_other
+
 
 @pytest.mark.asyncio
 async def test_cache_and_pop_bytes(monkeypatch):

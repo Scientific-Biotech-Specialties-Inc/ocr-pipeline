@@ -3,7 +3,7 @@
 Verifies the full asynchronous receipt lifecycle:
 1. HTTP ingestion (POST /api/ocr/process) returning 202 Accepted.
 2. File download from external URL via HTTP.
-3. Real OCR extraction (PaddleOCR / Tesseract) + Ollama HTTP assist.
+3. Real OCR extraction (PaddleOCR / Tesseract) + Gemini HTTP assist.
 4. Outbound webhook callback delivery with authorization headers and validated payload.
 5. Job status persistence and retrieval (GET /api/jobs/{job_id}/status).
 6. pgvector similarity search (POST /api/duplicate-check).
@@ -55,7 +55,7 @@ async def test_e2e_full_receipt_processing_lifecycle(mock_fixture_server):
         assert "message" in ingest_data
 
         # Step 2: Execute asynchronous worker processing
-        # In E2E, this exercises real HTTP download, real OCR, mock Ollama HTTP client,
+        # In E2E, this exercises real HTTP download, real OCR, mock Gemini HTTP client,
         # and real outbound webhook callback
         await pipeline.process_receipt(
             job_id=job_id,

@@ -14,12 +14,16 @@ services:
       - REDIS_URL=redis://ocr_redis:6379/0
       - MONGODB_URL=mongodb://ocr_mongo:27017
       - POSTGRES_URL=postgresql+asyncpg://ocr_user:secret@ocr_postgres:5432/ocr_pipeline
-      - OLLAMA_BASE_URL=http://ocr_ollama:11434
+      - LLM_PROVIDER=${LLM_PROVIDER:-gemini}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.0-flash}
+      - GEMINI_BASE_URL=${GEMINI_BASE_URL:-https://generativelanguage.googleapis.com/v1beta}
+      - GEMINI_TIMEOUT=${GEMINI_TIMEOUT:-15.0}
+      - ENABLE_LLM_ITEM_NORMALIZATION=${ENABLE_LLM_ITEM_NORMALIZATION:-true}
     depends_on:
       - redis
       - mongodb
       - postgres
-      - ollama
     networks:
       - ocr_network
       - shared-capstone-network
@@ -35,7 +39,12 @@ services:
       - REDIS_URL=redis://ocr_redis:6379/0
       - MONGODB_URL=mongodb://ocr_mongo:27017
       - POSTGRES_URL=postgresql+asyncpg://ocr_user:secret@ocr_postgres:5432/ocr_pipeline
-      - OLLAMA_BASE_URL=http://ocr_ollama:11434
+      - LLM_PROVIDER=${LLM_PROVIDER:-gemini}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.0-flash}
+      - GEMINI_BASE_URL=${GEMINI_BASE_URL:-https://generativelanguage.googleapis.com/v1beta}
+      - GEMINI_TIMEOUT=${GEMINI_TIMEOUT:-15.0}
+      - ENABLE_LLM_ITEM_NORMALIZATION=${ENABLE_LLM_ITEM_NORMALIZATION:-true}
       # Cap OpenMP threads per process. The OCR pool runs Tesseract passes
       # concurrently; each subprocess would otherwise spawn a full OpenMP team
       # (8 threads), and 6 concurrent passes thrash the CPU - measured 26x
@@ -48,7 +57,6 @@ services:
       - redis
       - mongodb
       - postgres
-      - ollama
     networks:
       - ocr_network
       - shared-capstone-network
@@ -85,20 +93,6 @@ services:
     networks:
       - ocr_network
 
-  ollama:
-    image: ollama/ollama
-    container_name: ocr_ollama
-    ports:
-      - "11434:11434"
-    volumes:
-      - ocr_ollama_data:/root/.ollama
-      - ./scripts/ollama-entrypoint.sh:/ollama-entrypoint.sh
-    environment:
-      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen3:1.7b}
-    entrypoint: ["/bin/bash", "/ollama-entrypoint.sh"]
-    networks:
-      - ocr_network
-
 networks:
   ocr_network:
     driver: bridge
@@ -108,4 +102,3 @@ networks:
 volumes:
   ocr_mongo_data:
   ocr_postgres_data:
-  ocr_ollama_data:

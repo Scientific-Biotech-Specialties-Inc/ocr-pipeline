@@ -49,7 +49,7 @@ The primary consumers of this pipeline are internal microservices, specifically 
 - **API Layer:** FastAPI (Python 3.12+)
 - **Task Queue:** Celery, backed by Redis
 - **Databases:** PostgreSQL (with `pgvector` for embeddings), MongoDB (for metadata)
-- **AI/ML Tools:** PyTesseract (OCR), OpenCV (Image processing), `sentence-transformers` (Embeddings), Ollama (Local LLM fallback/processing)
+- **AI/ML Tools:** PaddleOCR & PyTesseract (OCR), OpenCV (Image processing), `sentence-transformers` (Embeddings), Google AI Studio Gemini (LLM structured extraction & semantics)
 - **Deployment:** Docker & Docker Compose
 
 ### Conceptual Data Model

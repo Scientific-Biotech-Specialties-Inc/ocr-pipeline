@@ -95,12 +95,14 @@ def compute_content_hash(
     country: str | None = None,
     currency: str | None = None,
     location: str | None = None,
+    llm_provider: str | None = None,
 ) -> str:
-    """Compute deterministic SHA-256 hash for file content and caller locale overrides."""
+    """Compute deterministic SHA-256 hash for file content, locale overrides, and LLM provider."""
     hasher = hashlib.sha256()
     for b in file_bytes_list:
         hasher.update(b)
-    meta = f"|{country or ''}|{currency or ''}|{location or ''}"
+    provider_str = (llm_provider if llm_provider is not None else settings.llm_provider).lower().strip()
+    meta = f"|{country or ''}|{currency or ''}|{location or ''}|{provider_str}"
     hasher.update(meta.encode("utf-8"))
     return hasher.hexdigest()
 
