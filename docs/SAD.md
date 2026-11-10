@@ -5,7 +5,7 @@ The OCR Pipeline is designed as an asynchronous, microservice-based architecture
 
 ### High-Level Design Pattern
 - **API Gateway / Entrypoint:** FastAPI provides a lightweight, high-performance REST API layer.
-- **Asynchronous Task Queue:** Celery workers manage the heavy processing (OpenCV, PaddleOCR, PyTesseract, sentence-transformers, Ollama).
+- **Asynchronous Task Queue:** Celery workers manage the heavy processing (OpenCV, PaddleOCR, PyTesseract, sentence-transformers, Google AI Studio Gemini).
 - **Message Broker:** Redis coordinates task queue state and acts as a caching layer.
 - **Data Persistence:** 
   - **MongoDB:** Stores unstructured document extraction outputs, task statuses, and processing logs.
@@ -21,7 +21,9 @@ The OCR Pipeline is designed as an asynchronous, microservice-based architecture
 | **OCR Processing** | PyTesseract & OpenCV | OpenCV cleans/pre-processes images (deskewing, binarization) to optimize Tesseract's printed-text recognition accuracy. |
 | **Vector Database** | PostgreSQL + pgvector | Avoids introducing a separate specialized vector DB; allows query caching and seamless relational storage of metadata. |
 | **NoSQL Database** | MongoDB | Stores raw extracted text, complex line-items tables, and dynamic metadata without schema lock-in. |
-| **Local LLM** | Ollama (Qwen2.5:1.5b) | Handles advanced parsing, fallback corrections, and extraction formatting locally without external API costs. |
+| **LLM** | Google AI Studio (Gemini 2.0 Flash) | Handles advanced parsing, financial semantics, item normalization, and closed-list candidate selections. |
+
+> **Architectural Transition:** Migrated from local Ollama (`qwen2.5:1.5b` / `qwen3:1.7b`) to Google AI Studio (`gemini-2.0-flash`) to eliminate 20–85s CPU inference latencies and container memory overhead while enabling batch line item normalization.
 
 ---
 

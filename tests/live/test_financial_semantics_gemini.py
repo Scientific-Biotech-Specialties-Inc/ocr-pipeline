@@ -1,6 +1,6 @@
-"""Opt-in Qwen financial-semantics checks against the receipt corpus.
+"""Opt-in Gemini financial-semantics checks against the receipt corpus.
 
-Run with RUN_LIVE_LLM=1 and a reachable Ollama configured with OLLAMA_MODEL.
+Run with RUN_LIVE_LLM=1 and a configured GEMINI_API_KEY.
 """
 
 from pathlib import Path
@@ -10,7 +10,7 @@ import pytest
 from PIL import Image
 
 from app.core.ocr_engine import read_pooled
-from app.llm.ollama_provider import OllamaProvider
+from app.llm.gemini_provider import GeminiProvider
 
 pytestmark = [
     pytest.mark.live_llm,
@@ -34,10 +34,11 @@ async def test_financial_semantics_is_bounded_for_corpus_receipt(name):
     if not image.exists():
         pytest.skip(f"fixture unavailable: {name}")
     bundle = await read_pooled(Image.open(image), lang="eng")
-    raw = await OllamaProvider().analyze_financial_semantics(bundle.combined_text)
+    raw = await GeminiProvider().analyze_financial_semantics(bundle.combined_text)
     if raw is None:
-        pytest.skip("Ollama unavailable")
+        pytest.skip("Gemini unavailable")
     assert set(raw) >= {"tax_basis", "confidence", "evidence", "currency"}
     assert raw["tax_basis"] in {"inclusive", "exclusive", "unknown"}
     assert isinstance(raw["evidence"], (list, str))
     assert not any(key in raw for key in ("total_amount", "tax_amount", "net_sales"))
+

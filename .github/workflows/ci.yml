@@ -44,7 +44,8 @@ jobs:
       MONGODB_URL: mongodb://localhost:27017
       MONGODB_DATABASE: ocr_pipeline_test
       POSTGRES_URL: postgresql+asyncpg://ocr_user:secret@localhost:5432/ocr_pipeline
-      OLLAMA_BASE_URL: http://localhost:11434
+      LLM_PROVIDER: gemini
+      GEMINI_MODEL: gemini-2.0-flash
     steps:
       - uses: actions/checkout@v4
 
@@ -116,7 +117,8 @@ jobs:
       MONGODB_URL: mongodb://localhost:27017
       MONGODB_DATABASE: ocr_pipeline_test
       POSTGRES_URL: postgresql+asyncpg://ocr_user:secret@localhost:5432/ocr_pipeline
-      OLLAMA_BASE_URL: http://localhost:11434
+      LLM_PROVIDER: gemini
+      GEMINI_MODEL: gemini-2.0-flash
 
     steps:
       - uses: actions/checkout@v4

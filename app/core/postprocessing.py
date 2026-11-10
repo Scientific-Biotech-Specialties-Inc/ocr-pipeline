@@ -209,7 +209,7 @@ async def normalize_extraction(
     """In-place mutation of the extraction object to apply normalization rules.
 
     ``use_llm=False`` keeps the deterministic dictionary corrections while
-    skipping the Ollama batch call - used by the single-pass fast path where a
+    skipping the LLM batch call - used by the single-pass fast path where a
     round trip to the model would cost more than the correction it could make.
     """
     dict_corrector = DictionaryCorrector()

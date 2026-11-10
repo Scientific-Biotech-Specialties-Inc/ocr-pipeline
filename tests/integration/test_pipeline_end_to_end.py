@@ -63,7 +63,7 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> Harness:
     monkeypatch.setattr(pipeline.MongoDBClient, "update_job_status", fake_update)
     monkeypatch.setattr(pipeline, "send_callback", fake_callback)
     monkeypatch.setattr(pipeline, "_store_embedding", fake_store_embedding)
-    # No Ollama, sentence-transformers, or dynamic PaddleOCR model downloads in test environment;
+    # No external Gemini LLM, sentence-transformers, or dynamic PaddleOCR model downloads in test environment;
     # assists must degrade deterministically to the baseline verified by these fixtures.
     monkeypatch.setattr(pipeline, "_embedder", lambda: None)
     monkeypatch.setattr(ocr_engine, "_get_paddle_ocr", lambda: None)

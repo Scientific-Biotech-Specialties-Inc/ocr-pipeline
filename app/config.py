@@ -15,20 +15,14 @@ class Settings(BaseSettings):
     callback_max_retries: int = 3
     callback_backoff_seconds: str = "10,30,60"
 
-    # Ollama config
-    ollama_base_url: str = "http://ocr_ollama:11434"
-    ollama_model: str = "qwen3:1.7b"
-    llm_provider: str = "ollama"
-    # How long the model stays resident in memory after a call. -1 keeps the
-    # model permanently resident in memory to eliminate cold reload latency.
-    ollama_keep_alive: str = "-1"
-    # Explicit context window (2048 comfortably covers the 6000-char prompt cap
-    # while keeping qwen3:1.7b resident RAM under ~1.55 GB inside a 2 GB limit).
-    ollama_num_ctx: int = 2048
-    # Timeout for optional LLM assists; fail soft to deterministic baseline
-    ollama_assist_timeout: float = 20.0
-    # Line items LLM normalization toggle (skips redundant 20-85s batch LLM call on CPU)
-    enable_llm_item_normalization: bool = False
+    # LLM config (Google AI Studio Gemini)
+    llm_provider: str = "gemini"
+    gemini_api_key: str = ""
+    gemini_model: str = "gemini-2.0-flash"
+    gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
+    gemini_timeout: float = 15.0
+    # Line items LLM normalization toggle (enabled by default with fast Gemini inference)
+    enable_llm_item_normalization: bool = True
 
     # Cache TTLs (seconds)
     file_cache_byte_ttl: int = 600          # 10 minutes ephemeral byte handoff

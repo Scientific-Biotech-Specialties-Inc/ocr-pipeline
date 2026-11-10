@@ -39,7 +39,7 @@ If the prompt or the AI model/agent requires context, constraints, or schemas fr
 | **Message Broker / Cache** | Redis                                                       | Celery broker; file-hash caching (`ocr:file_hash:<sha256>`, TTL 90d)             |
 | **NoSQL Database**         | MongoDB (`motor`)                                           | Job status, raw OCR results, extracted fields, BIR validation, confidence scores |
 | **Vector Database**        | PostgreSQL + `pgvector` (`sqlalchemy`, `asyncpg`)           | 384-dim receipt embeddings; cosine similarity duplicate detection                |
-| **Local LLM**              | Ollama (`qwen3:1.7b`)                                       | Structured field extraction from raw OCR text                                    |
+| **LLM**                    | Google AI Studio (`gemini-2.0-flash`)       | Structured field extraction from raw OCR text                                    |
 | **OCR Engine**             | PaddleOCR + Tesseract (`paddleocr`, `pytesseract`) + OpenCV | Image pre-processing + PaddleOCR primary + Tesseract fallback                    |
 | **Embeddings**             | Sentence-Transformers (`all-MiniLM-L6-v2`)                  | 384-dim vector generation                                                        |
 | **ML Anomaly Model**       | Scikit-learn (`RandomForestClassifier`)                     | Receipt anomaly risk scoring (0.0–1.0)                                           |
@@ -51,10 +51,12 @@ If the prompt or the AI model/agent requires context, constraints, or schemas fr
 ## Architecture & Infrastructure
 
 - Docker Compose (`docker-compose.yml`) orchestrates all services.
-- `ocr_ollama` container auto-pulls `qwen3:1.7b` via `scripts/ollama-entrypoint.sh` on first start.
 - `ocr_api` caches `all-MiniLM-L6-v2` during image build via `scripts/download_model.py`.
+- LLM structured field assists, batch item normalization, and category tie-breaking are served via Google AI Studio (`gemini-2.0-flash`).
 - All containers communicate over a private Docker bridge network (`ocr_network`).
 - An **external** Docker network `shared-capstone-network` is required so SERMS and PRS can route callbacks.
+
+> **Architectural Transition:** The system has transitioned from a local CPU-bound Ollama container (`qwen2.5:1.5b` / `qwen3:1.7b`) to Google AI Studio (`gemini-2.0-flash`). This transition eliminates local container cold reload delays, reduces host memory overhead by ~2 GB, and enables real-time batch line-item normalization.
 
 ### Container roster
 
@@ -65,7 +67,6 @@ If the prompt or the AI model/agent requires context, constraints, or schemas fr
 | `ocr_redis`    | `6380`    | Broker / cache  |
 | `ocr_mongo`    | `27017`   | Job store       |
 | `ocr_postgres` | `5433`    | Embedding store |
-| `ocr_ollama`   | `11434`   | Local LLM       |
 
 ---
 
@@ -97,7 +98,7 @@ Each `process_receipt_task` Celery job runs these stages in order:
 1. **Download & Ingest** — fetch file from `file_url` or parallel `file_urls` (multi-segment receipts up to 6); 3-zone blur verification for tall receipts
 2. **Pre-process & Strip Tiling** — OpenCV (grayscale, deskew, adaptive thresholding, denoising); tall single-image receipts and tall `file_urls` segments (`height >= 1800` & `aspect >= 2.8`) automatically sliced into overlapping strips (capped at 10 strips)
 3. **OCR & Seam Stitching** — PaddleOCR extracts primary text & geometry on upright images; single-pass OpenCV + Tesseract serves as fallback; middle item segments complete via density-aware fast path; multi-segment/strip texts merged via 30-line seam deduplication, 7-digit barcode matching, and margin-guarded auto-ordering; unified anchors scored; targeted CLAHE crop recovery on header/footer if fields missing
-4. **LLM extraction** — Ollama `qwen3:1.7b` (non-thinking JSON mode, `num_ctx=2048`, integer `keep_alive`) parses vendor, location, tax basis, currency, and subtotal verification (prompt bounded to 2000 head + 2000 tail characters)
+4. **LLM extraction** — Google AI Studio `gemini-2.0-flash` (via async REST API, `responseMimeType: application/json`) parses vendor, location, tax basis, currency, subtotal verification, batch item normalization, and category tie-breaking
 5. **BIR validation** — `app/core/bir_validator.py` validates TIN format, VAT classification
 6. **Confidence scoring & Reconciliation** — `app/core/confidence.py` computes composite score (≥ 0.75 = acceptable); receipts (≥ 3 items) near-reconciled within 3% or lacking total target emit line items with score capped at 0.79 (`REASON_NEAR_RECONCILED`), and `needs_manual_review` is always surfaced on the callback payload
 7. **Anomaly risk scoring** — `RandomForestClassifier` assigns a risk score (0.0–1.0) and category (`Low` / `Medium` / `High Risk`)
@@ -143,7 +144,8 @@ Full schema: [`docs/DSD.md`](DSD.md).
 | `APP_PORT`                         | `8010`                      | FastAPI listen port                        |
 | `SERMS_API_KEY` / `PRS_API_KEY`    | —                           | Inbound Bearer token auth                  |
 | `CALLBACK_API_KEY`                 | —                           | Key attached to outbound webhook callbacks |
-| `OLLAMA_BASE_URL` / `OLLAMA_MODEL` | `http://ocr_ollama:11434`   | Local LLM                                  |
+| `LLM_PROVIDER`                     | `gemini`                    | LLM provider (`gemini`)                    |
+| `GEMINI_API_KEY` / `GEMINI_MODEL`  | — / `gemini-2.0-flash`      | Google AI Studio LLM credentials           |
 | `REDIS_URL`                        | `redis://ocr_redis:6379/0`  | Celery broker                              |
 | `MONGODB_URL` / `MONGODB_DATABASE` | `mongodb://ocr_mongo:27017` | Job store                                  |
 | `POSTGRES_URL`                     | —                           | Async pgvector connection                  |

@@ -8,7 +8,7 @@
 
 ---
 
-> This is a **headless Python/FastAPI microservice**. There is no UI, no frontend, and no database used directly by end users. The QA surface covers: API endpoint validation, Celery background task correctness, OCR pipeline accuracy (PaddleOCR/Tesseract cross-reference + Ollama extraction), BIR validation logic, pgvector duplicate detection, and callback delivery. Consuming services are **SERMS** (expense management) and **PRS** (Productivity Report System).
+> This is a **headless Python/FastAPI microservice**. There is no UI, no frontend, and no database used directly by end users. The QA surface covers: API endpoint validation, Celery background task correctness, OCR pipeline accuracy (PaddleOCR/Tesseract cross-reference + Gemini extraction), BIR validation logic, pgvector duplicate detection, and callback delivery. Consuming services are **SERMS** (expense management) and **PRS** (Productivity Report System).
 
 ---
 
@@ -25,7 +25,7 @@
 
 **Out of Scope:**
 - SERMS and PRS application logic (separate projects).
-- Ollama model accuracy itself (treated as a vendor dependency; only the integration contract is tested).
+- Google AI Studio (Gemini) model accuracy itself (treated as an external API dependency; only the integration contract is tested).
 - Load / stress testing (not applicable for V1).
 - UI / browser testing (no frontend).
 
@@ -36,14 +36,14 @@
 | Lint & Static analysis | `ruff` | Local / GitHub Actions | Root | Developer |
 | Unit tests | `pytest` + `pytest-asyncio` | Mocked (no live containers) | `tests/unit/` | Developer |
 | Integration tests | `pytest` + live containers (`pgvector`, `mongo:7`, `redis:alpine`) | Local Docker / GitHub Actions `services:` | `tests/integration/` | Developer / QA |
-| End-to-End tests | `pytest` + full microservice flow + mock Ollama & Webhook | Local / GitHub Actions `services:` | `tests/e2e/` | Developer / QA |
-| Live LLM tests | Opt-in live `qwen3:1.7b` via `RUN_LIVE_LLM=1` | Local Docker (`ocr_ollama`) | `tests/live/` | Developer / AI Lead |
+| End-to-End tests | `pytest` + full microservice flow + mock Gemini & Webhook | Local / GitHub Actions `services:` | `tests/e2e/` | Developer / QA |
+| Live LLM tests | Opt-in live `gemini-2.0-flash` via `RUN_LIVE_LLM=1` | External Google AI Studio API | `tests/live/` | Developer / AI Lead |
 | Manual API testing | Postman / `httpx` against live stack | Docker Compose (`http://localhost:8010`) | Local | Developer / QA |
 
 **Mocking & Isolation strategy:**
-- **Unit tests (`tests/unit/`):** All external dependencies (Ollama, MongoDB, Redis, PostgreSQL) are **mocked** using `unittest.mock` / `pytest-mock`. No live containers required.
+- **Unit tests (`tests/unit/`):** All external dependencies (Gemini, MongoDB, Redis, PostgreSQL) are **mocked** using `unittest.mock` / `pytest-mock`. No live containers or external API keys required.
 - **Integration tests (`tests/integration/`):** PostgreSQL `pgvector`, MongoDB, and Redis run as live containers. Verifies Alembic migrations, pgvector cosine search, MongoDB job states, Redis caching, and real OpenCV/PaddleOCR/Tesseract engine passes.
-- **End-to-End tests (`tests/e2e/`):** Runs the full asynchronous receipt lifecycle (HTTP ingestion $\to$ Celery task execution $\to$ OCR $\to$ Mock Ollama $\to$ Webhook callback $\to$ Duplicate detection) using a self-contained in-memory fixture server for receipts, callbacks, and deterministic LLM responses.
+- **End-to-End tests (`tests/e2e/`):** Runs the full asynchronous receipt lifecycle (HTTP ingestion $\to$ Celery task execution $\to$ OCR $\to$ Mock Gemini $\to$ Webhook callback $\to$ Duplicate detection) using a self-contained in-memory fixture server for receipts, callbacks, and deterministic LLM responses.
 
 ---
 
@@ -83,13 +83,13 @@
 | S-01 | Invalid API key | `POST /api/ocr/process` with missing or wrong API key | Returns `403 Forbidden` |
 | S-02 | Malformed request body | Missing `receipt_id` or `file_url` | Returns `422 Unprocessable Entity` |
 | S-03 | File download failure | `file_url` returns a non-200 response | Job marked `failed`; failure callback sent; Celery retries |
-| S-04 | Ollama timeout / unstructured output | Mocked Ollama returns empty or malformed JSON | Pipeline logs error; job marked `failed`; Celery retries (up to 3x) |
+| S-04 | Gemini timeout / unstructured output | Mocked Gemini returns empty or malformed JSON | Pipeline logs error; job marked `failed`; Celery retries (up to 3x) |
 | S-05 | BIR TIN invalid | `validate_tin()` with malformed TIN | Returns `False`; `tin_valid: false` in job record |
 | S-06 | All Celery retries exhausted | Task fails 3 consecutive times | Final `failed` status written to MongoDB; failure callback dispatched |
 | S-07 | Confidence score below threshold | Candidate scores low or extracted data is sparse | Composite score < 0.75; flagged in job record for review |
 | S-08 | Fast-path single pass is insufficient | Clean OCR but unreconciled money or missing total | Pipeline escalates to full pooled OCR; hard receipts keep pooled accuracy |
 | S-09 | Fast-path OCR failure | Preprocessing raises during `read_fast` | Fail-soft: worker falls back to pooled OCR; job completes normally |
-| S-10 | Consolidated assist fails | Mocked Ollama returns malformed JSON for the single assist call | Deterministic baseline retained; vendor/location/semantics/subtotal fall back individually |
+| S-10 | Consolidated assist fails | Mocked Gemini returns malformed JSON for the single assist call | Deterministic baseline retained; vendor/location/semantics/subtotal fall back individually |
 | S-11 | OCR separator variants break invoice-number lookup | Fast-path text reads `Invoice number; 45065` or `No, 38326` (semicolon/comma) | `INVOICE_LABEL_RE` accepts `;` and `,` separators; covered by `tests/unit/test_extractors.py` |
 | S-12 | `Sdn. Bhd.` company suffix misread as currency | Malaysian `my_pos` receipt contains `Sdn. Bhd.` | `explicit_currency` skips `BHD` when preceded by `Sdn.`; locale falls back to `MYR` via country |
 | S-13 | Malaysian SST receipt basis unresolved | `my_pos` prints `Subtotal` / `SST 6%` / `TOTAL` with no inclusive/exclusive wording | `infer_tax_basis` adds a MY SST/GST country fallback → exclusive, so `total_sales = net + tax` derives |
@@ -129,7 +129,7 @@ pytest tests/unit/ -v
 # 3. Integration test suite — live pgvector, mongodb, redis containers
 pytest tests/integration/ -v -m integration
 
-# 4. End-to-End test suite — full pipeline + mock Ollama & Webhook
+# 4. End-to-End test suite — full pipeline + mock Gemini & Webhook
 pytest tests/e2e/ -v -m e2e
 
 # 5. Verify Alembic migrations
@@ -142,7 +142,7 @@ Runs on every PR and push to `main`:
 1. `lint`: `ruff check .`
 2. `unit`: `pytest tests/unit/ -v`
 3. `integration`: Runs against GitHub Actions service containers (`pgvector/pgvector:pg16`, `mongo:7`, `redis:alpine`) with real OCR packages (`tesseract-ocr`, `poppler-utils`).
-4. `e2e`: Runs full asynchronous flow test suite against service containers + mock Ollama fixture server.
+4. `e2e`: Runs full asynchronous flow test suite against service containers + mock Gemini fixture server.
 
 Azure Container Apps deployment (`.github/workflows/deploy.yml`) is strictly gated on the CI workflow passing.
 
@@ -192,16 +192,18 @@ A release is approved when all the following are true:
 
 ## 7. AI / LLM Evaluation
 
-The pipeline uses **Ollama (Qwen2.5 1.5B)** for structured field extraction from raw OCR text. This is a core functional dependency.
+The pipeline uses **Google AI Studio (`gemini-2.0-flash`)** for structured field extraction assists, line-item spelling normalization, and category tie-breaking from raw OCR text.
+
+> **Architectural Transition:** The project migrated from local CPU-based Ollama (`qwen2.5:1.5b` / `qwen3:1.7b`) to Google AI Studio (`gemini-2.0-flash`). This shift eliminated high local container RAM utilization and multi-minute Ollama wait times on receipt batches, while enabling live line-item normalization.
 
 **Eval scope:**
-- Structured extraction correctness is validated via unit tests with mocked Ollama responses (not live model evaluation).
+- Structured extraction correctness is validated via unit tests with mocked Gemini responses (not live model evaluation).
 - Real-world model quality (hallucinations, missing fields) is assessed during manual testing using synthetic fixture receipts.
 - If extraction accuracy falls below acceptable thresholds in production (identified via `composite_confidence_score` distribution in MongoDB), an investigation into prompt engineering or model upgrade should be opened as a P1.
 
-> **Red-team note:** If the Ollama model is ever exposed to an external API surface or user-provided prompts, a prompt injection assessment must be added here.
+> **Red-team note:** If the Gemini model is ever exposed to an external API surface or user-provided prompts, a prompt injection assessment must be added here.
 
 ## 8. Financial semantics QA
-Offline tests cover provider JSON parsing/failure, confidence and OCR-evidence grounding, caller/receipt/OCR/LLM currency precedence, inclusive/exclusive/unknown arithmetic, conditional computed totals, multiple tax-line aggregation, item target selection, request normalization, and optional callback fields. Live model cases use `@pytest.mark.live_llm` and an explicit opt-in command; they skip only when Ollama is unavailable and assert stable semantic outcomes rather than exact model wording. The default suite never requires Ollama.
+Offline tests cover provider JSON parsing/failure, confidence and OCR-evidence grounding, caller/receipt/OCR/LLM currency precedence, inclusive/exclusive/unknown arithmetic, conditional computed totals, multiple tax-line aggregation, item target selection, request normalization, and optional callback fields. Live model cases use `@pytest.mark.live_llm` and an explicit opt-in command (`tests/live/test_financial_semantics_gemini.py`); they skip when `RUN_LIVE_LLM` is unset or `GEMINI_API_KEY` is unavailable, and assert stable semantic outcomes rather than exact model wording. The default suite never requires external live API keys.
 
 Known limitation: tax aggregation relies on the existing geometry label scanner. A tax-like line that cannot be paired to a money token, or a layout where tax and discount labels are inseparable, is withheld rather than aggressively interpreted.

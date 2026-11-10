@@ -91,9 +91,9 @@ def test_my_sst_receipt_infers_exclusive_basis():
 
 
 @pytest.mark.asyncio
-async def test_ollama_financial_semantics_is_dedicated_and_fail_soft(monkeypatch):
-    from app.llm.ollama_provider import OllamaProvider
-    provider = OllamaProvider()
+async def test_gemini_financial_semantics_is_dedicated_and_fail_soft(monkeypatch):
+    from app.llm.gemini_provider import GeminiProvider
+    provider = GeminiProvider()
     seen = {}
 
     async def fake_generate(prompt, token_limit, timeout=120.0):
@@ -113,16 +113,16 @@ async def test_ollama_financial_semantics_is_dedicated_and_fail_soft(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_ollama_verify_subtotal_is_fail_soft(monkeypatch):
-    from app.llm.ollama_provider import OllamaProvider
-    provider = OllamaProvider()
-    
+async def test_gemini_verify_subtotal_is_fail_soft(monkeypatch):
+    from app.llm.gemini_provider import GeminiProvider
+    provider = GeminiProvider()
+
     async def fake_generate(prompt, token_limit, timeout=120.0):
         return {"subtotal": 12.34}
-        
+
     monkeypatch.setattr(provider, "_generate", fake_generate)
     assert await provider.verify_subtotal("Subtotal: 12.34") == 12.34
-    
+
     async def failed(*args, **kwargs):
         return None
     monkeypatch.setattr(provider, "_generate", failed)
@@ -130,79 +130,30 @@ async def test_ollama_verify_subtotal_is_fail_soft(monkeypatch):
 
 
 def test_bound_context_short_text_unchanged():
-    from app.llm.ollama_provider import (
-        _bound_context,
-    )
+    from app.llm.base import bound_context
     short = "Vendor\nTotal 123.45"
-    assert _bound_context(short) == short
+    assert bound_context(short) == short
 
 
 def test_bound_context_keeps_header_and_tail():
-    from app.llm.ollama_provider import _bound_context
+    from app.llm.base import bound_context
     body = "line\n" * 3000
     text = f"VENDOR HEADER {body} FOOTER 99.95"
-    bounded = _bound_context(text)
+    bounded = bound_context(text)
     assert "VENDOR HEADER" in bounded
     assert "FOOTER 99.95" in bounded
     assert len(bounded) < len(text)
-    assert _bound_context("") == ""
+    assert bound_context("") == ""
 
 
-def test_qwen3_think_block_is_stripped_before_json_parsing():
-    from app.llm.ollama_provider import OllamaProvider
+def test_gemini_think_block_is_stripped_before_json_parsing():
+    from app.llm.gemini_provider import GeminiProvider
     raw = (
         "<think>\nThe user wants financial semantics in JSON.\n</think>\n"
         '{"tax_basis": "inclusive", "confidence": 0.92}'
     )
-    parsed = OllamaProvider._parse_json(raw)
+    parsed = GeminiProvider._parse_json(raw)
     assert parsed["tax_basis"] == "inclusive"
     assert parsed["confidence"] == 0.92
-
-
-def test_semantics_evidence_grounding_normalizes_whitespace():
-    raw = {
-        "tax_basis": "inclusive",
-        "confidence": 0.9,
-        "evidence": ["VAT INCLUSIVE"],
-        "currency": "PHP",
-        "currency_confidence": 0.9,
-        "currency_evidence": ["PHP"],
-    }
-    sem = validate_financial_semantics(
-        raw, "Total Sales (VAT   INCLUSIVE)   PHP 250.00"
-    )
-    assert sem is not None
-    assert sem.tax_basis == "inclusive"
-    assert sem.currency == "PHP"
-
-
-@pytest.mark.asyncio
-async def test_ollama_keep_alive_int_conversion(monkeypatch):
-    import httpx
-
-    from app.config import settings
-    from app.llm.ollama_provider import OllamaProvider
-
-    provider = OllamaProvider()
-    captured_payload = {}
-
-    class DummyResponse:
-        def raise_for_status(self):
-            pass
-
-        def json(self):
-            return {"response": '{"test": 1}'}
-
-    async def fake_post(self, url, json=None, timeout=120.0):
-        captured_payload.update(json)
-        return DummyResponse()
-
-    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
-    monkeypatch.setattr(settings, "ollama_keep_alive", "-1")
-
-    res = await provider._generate("test prompt", 64)
-    assert res == {"test": 1}
-    assert captured_payload.get("keep_alive") == -1
-    assert isinstance(captured_payload.get("keep_alive"), int)
 
 

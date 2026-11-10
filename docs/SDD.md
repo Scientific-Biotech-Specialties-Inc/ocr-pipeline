@@ -86,7 +86,12 @@ The microservice is configured using environment variables loaded at runtime via
 | `APP_PORT` | integer | `8010` | Port FastAPI listens on inside the container. |
 | `SERMS_API_KEY` | string | — | Pre-shared key for authenticating incoming API requests. |
 | `CALLBACK_API_KEY` | string | — | API key attached to outgoing webhook callbacks. |
-| `OLLAMA_BASE_URL` | URL string | `http://ocr_ollama:11434` | Base connection URL for Ollama local LLM processing. |
+| `LLM_PROVIDER` | string | `gemini` | Active LLM assist provider (`gemini`). |
+| `GEMINI_API_KEY` | string | — | Google AI Studio API key for `gemini` LLM provider. |
+| `GEMINI_MODEL` | string | `gemini-2.0-flash` | Gemini model name used (`gemini-2.0-flash`). |
+| `GEMINI_BASE_URL` | URL string | `https://generativelanguage.googleapis.com/v1beta` | Base URL for Google AI Studio REST endpoints. |
+| `GEMINI_TIMEOUT` | float | `15.0` | Timeout in seconds for Gemini API assist calls. |
+| `ENABLE_LLM_ITEM_NORMALIZATION` | boolean | `true` | Whether to invoke Gemini for complex line-item noise normalization. |
 | `REDIS_URL` | URL string | `redis://ocr_redis:6379/0` | URL for Celery message broker. |
 | `MONGODB_URL` | URL string | `mongodb://ocr_mongo:27017` | Database connection string for MongoDB. |
 | `POSTGRES_URL` | URL string | — | Async pgvector database connection string. |
@@ -94,10 +99,6 @@ The microservice is configured using environment variables loaded at runtime via
 | `DUPLICATE_SIMILARITY_THRESHOLD` | float | `0.85` | Cosine similarity cutoff for flagging duplicates. |
 | `DUPLICATE_DAYS_WINDOW` | integer | `90` | Timeframe in days to look back for duplicate receipts. |
 | `OMP_NUM_THREADS` / `OMP_THREAD_LIMIT` | integer | `1` | Container-level OpenMP caps for worker Tesseract fallback processes. |
-| `OLLAMA_KEEP_ALIVE` | string | `-1` | How long the Ollama model stays resident after a call (`-1` = indefinite, preventing cold KV cache reloads). |
-| `OLLAMA_NUM_CTX` | integer | `2048` | Explicit context window sent with each generation request (keeps `qwen3:1.7b` resident RAM ~1.55 GB within a 2 GB limit). |
-| `OLLAMA_ASSIST_TIMEOUT` | float | `20.0` | Timeout in seconds for Ollama assist calls to prevent worker thread starvation. |
-| `ENABLE_LLM_ITEM_NORMALIZATION` | boolean | `false` | Whether to invoke Ollama for line-item noise normalization (disabled by default; regex/Levenshtein handles normalization deterministically). |
 | `FILE_CACHE_BYTE_TTL` | integer | `600` | TTL in seconds for ephemeral image byte handoff between FastAPI and Celery worker (10 minutes). |
 | `FILE_CACHE_RESULT_TTL` | integer | `7776000` | TTL in seconds for identical receipt SHA-256 result cache (90 days). |
 | `RATE_LIMIT_ENABLED` | boolean | `true` | Enable/disable API rate limiting middleware. |
@@ -114,7 +115,9 @@ The microservice is configured using environment variables loaded at runtime via
 Colocated with the warm-model settings, the provider bounds what it feeds the model: only the receipt header (~3500 chars) plus a fixed totals tail (~2500 chars) are sent for selection/semantics/subtotal calls (`_bound_context`), dropping the long itemized middle that would otherwise tax CPU prefill with noise. Vendor/location names live in the header and totals/tax wording in the footer, so bounding preserves the regions the model actually answers from.
 
 ## 2.3 Financial semantics stage
-After deterministic baseline extraction, the worker conditionally asks the configured Ollama model (`qwen3:1.7b`, non-thinking JSON mode) for **one consolidated structured response** covering vendor choice, location, tax/currency semantics, and subtotal verification — a single bounded generation replaces up to four separate calls (on CPU-only Ollama each generation costs tens of seconds and concurrent calls serialize on the model queue). The prompt permits only tax basis, confidence/evidence, currency, closed-list vendor/location picks, and a subtotal; it cannot invent amounts outside the offered lists. Every field is validated by the caller against its closed list before use, so a wrong answer stays bounded and a hallucinated one is rejected exactly as before.
+> **Architectural Transition:** The LLM integration transitioned from local CPU-hosted Ollama (`qwen2.5:1.5b` / `qwen3:1.7b`) to Google AI Studio (`gemini-2.0-flash`). This transition eliminates local container cold reload delays, reduces host memory overhead by ~2 GB, and enables real-time batch line-item normalization.
+
+After deterministic baseline extraction, the worker conditionally asks Google AI Studio (`gemini-2.0-flash`, JSON mode) for **one consolidated structured response** covering vendor choice, location, tax/currency semantics, and subtotal verification. The prompt permits only tax basis, confidence/evidence, currency, closed-list vendor/location picks, and a subtotal; it cannot invent amounts outside the offered lists. Every field is validated by the caller against its closed list before use, so a wrong answer stays bounded and a hallucinated one is rejected exactly as before.
 
 Responses are accepted only at confidence >= 0.75 with evidence grounded in OCR and otherwise fail soft. The fast path deliberately skips the model (dictionary-only normalization, `use_llm=False`): when a single pass reconciles the receipt it does so without paying the LLM round trip.
 
@@ -145,7 +148,7 @@ The long-receipt pipeline addresses this via:
 7. **Near-Reconciliation & Closest-Basis Selection:** For receipts with `>= 3` items, if line items sum within `<= 3%` of printed subtotal/total, the items are emitted with `near_reconciled = True`, and the composite confidence score is capped at `0.79` (`REASON_NEAR_RECONCILED`). Even when unreconciled, the parser selects the price basis (`unit_price` vs `line_total`) closest to the target total so unit prices are multiplied by quantity appropriately.
 8. **Targeted Header/Footer Contrast Recovery:** If deterministic extraction lacks a `total_amount` or `vendor_name`/`vendor_tax_id`, the pipeline executes targeted high-contrast (CLAHE + upscale + denoise) crop OCR on the tail (bottom 35%) or head (top 30%), attaching recovered lines to supporting readings without re-running whole-receipt Tesseract passes.
 9. **Missing-Total Line Item Emission & Review Surfacing:** When a faded or cut-off grocery slip contains `>= 3` parsed items but no printed total target exists, items are preserved and emitted with `near_reconciled = True`. The `needs_manual_review` flag and `financial_reconciliation_status` are always propagated to the callback payload when verification detects an ungrounded or unreconciled receipt.
-10. **Bounded LLM Context & Keep-Alive Serialization:** Prompts sent to Ollama are bounded to 2000 head + 2000 tail characters to guarantee safe fit within `num_ctx=2048`, and `keep_alive` numeric duration strings (`"-1"`) are cast to integer `-1` to prevent Go time parser HTTP 400 errors.
+10. **Bounded LLM Context:** Prompts sent to Gemini are bounded to 2000 head + 2000 tail characters to focus attention on the header and totals regions while reducing token overhead.
 
 ## 2.5 Deterministic Date Extraction & Grounding
 Date extraction (`app/core/extractors.py`, `app/core/grounding.py`, `app/core/anchors.py`) enforces strict deterministic resolution:

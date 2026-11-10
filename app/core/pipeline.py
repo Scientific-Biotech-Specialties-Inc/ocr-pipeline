@@ -343,7 +343,8 @@ async def process_receipt(
 
         callback_fields = dict(verification.fields)
         has_callback_semantics = bool(
-            extraction.financial_semantics and extraction.financial_semantics.source == "qwen"
+            extraction.financial_semantics
+            and extraction.financial_semantics.source in {"qwen", "ollama", "gemini", "llm"}
         )
         if not has_callback_semantics:
             for key in ("tax_basis", "financial_reconciliation_status"):
@@ -670,10 +671,9 @@ async def _extract_with_assists(
     """Deterministic extraction, then one bounded model assist call.
 
     Runs the deterministic pass first so shortlists exist to constrain the model
-    with. All model asks - vendor, location, semantics, subtotal - are answered
-    by a SINGLE generation, because on a CPU-only Ollama every generation costs
-    tens of seconds and concurrent calls serialize on the model queue. Any
-    failure leaves the deterministic result in place.
+    with. All model asks - vendor, location, semantics, subtotal, and category -
+    are answered through Gemini 2.0 Flash. Any failure leaves the deterministic
+    result in place.
     """
     embedder = _embedder()
     baseline = extract(
@@ -739,7 +739,9 @@ async def _extract_with_assists(
         )
         if raw:
             if want_semantics:
-                sem = validate_financial_semantics(raw, bundle.combined_text)
+                sem = validate_financial_semantics(
+                    raw, bundle.combined_text, source=settings.llm_provider.lower()
+                )
                 arithmetic = _grounded_exclusive_basis(baseline, sem)
                 semantics = arithmetic if arithmetic is not None else sem
             if vendor_candidates:
@@ -749,8 +751,28 @@ async def _extract_with_assists(
             if want_subtotal:
                 corrected_subtotal = _float_or_none(raw.get("subtotal"))
 
+    category_tiebreaker_fn = None
+    if (
+        baseline.category_choice
+        and baseline.category_choice.runner_up
+        and baseline.category_choice.similarity is not None
+        and baseline.category_choice.similarity < 0.30
+    ):
+        try:
+            provider = create_provider()
+            picked_cat = await provider.choose_category(
+                bundle.combined_text[:1200],
+                (baseline.category_choice.category, baseline.category_choice.runner_up),
+            )
+            if picked_cat:
+                def category_tiebreaker_fn(_haystack: str, _options: tuple[str, ...]) -> str:
+                    return picked_cat
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Category tiebreak assist skipped: %s", exc)
+
     if (vendor_choice is None and location_choice is None
-            and semantics is None and corrected_subtotal is None):
+            and semantics is None and corrected_subtotal is None
+            and category_tiebreaker_fn is None):
         await normalize_extraction(baseline, bundle, use_llm=settings.enable_llm_item_normalization)
         return baseline
 
@@ -765,7 +787,7 @@ async def _extract_with_assists(
             caller_currency=caller_currency,
             caller_location=caller_location,
             embedder=embedder,
-            category_tiebreaker=None,
+            category_tiebreaker=category_tiebreaker_fn,
             llm_subtotal=corrected_subtotal,
         )
     )

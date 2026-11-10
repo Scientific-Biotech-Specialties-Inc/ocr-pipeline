@@ -3,7 +3,7 @@
 Provides a self-contained in-memory HTTP server that:
 1. Serves sample receipt images (GET /receipts/<filename>)
 2. Captures outbound webhook callbacks (POST /webhook/callback)
-3. Stubs Ollama LLM extraction (POST /api/generate) with deterministic JSON responses
+3. Stubs Gemini LLM extraction (POST /models/{model}:generateContent) with deterministic JSON responses
 """
 
 from __future__ import annotations
@@ -77,7 +77,7 @@ def fallback_when_services_offline(monkeypatch: pytest.MonkeyPatch):
 
 
 class FixtureRequestHandler(BaseHTTPRequestHandler):
-    """Handles HTTP requests for fixture images, webhook callbacks, and mock Ollama."""
+    """Handles HTTP requests for fixture images, webhook callbacks, and mock Gemini API."""
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
         # Silence default stderr logging during test runs
@@ -142,13 +142,15 @@ class FixtureRequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(b'{"status":"ok"}')
             return
 
-        # Mock Ollama generate endpoint
-        if self.path.startswith("/api/generate"):
+        # Mock Google AI Studio (Gemini) generateContent endpoint
+        if ":generateContent" in self.path or "/models/" in self.path:
             prompt = ""
             if body:
                 try:
                     req_json = json.loads(body.decode("utf-8"))
-                    prompt = req_json.get("prompt", "").lower()
+                    contents = req_json.get("contents") or []
+                    if contents and "parts" in contents[0]:
+                        prompt = (contents[0]["parts"][0].get("text") or "").lower()
                 except Exception:
                     pass
 
@@ -176,10 +178,15 @@ class FixtureRequestHandler(BaseHTTPRequestHandler):
                 })
 
             resp_payload = {
-                "model": "qwen3:1.7b",
-                "created_at": "2026-11-08T12:00:00Z",
-                "response": mock_response,
-                "done": True,
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [{"text": mock_response}],
+                            "role": "model",
+                        },
+                        "finishReason": "STOP",
+                    }
+                ]
             }
             resp_bytes = json.dumps(resp_payload).encode("utf-8")
             self.send_response(200)
@@ -213,12 +220,15 @@ def mock_fixture_server():
     thread.start()
 
     base_url = f"http://127.0.0.1:{port}"
-    # Configure application Ollama base URL to target this mock server
-    original_ollama_url = settings.ollama_base_url
-    settings.ollama_base_url = base_url
+    # Configure application Gemini base URL and key to target this mock server
+    original_gemini_url = settings.gemini_base_url
+    original_gemini_key = settings.gemini_api_key
+    settings.gemini_base_url = base_url
+    settings.gemini_api_key = "test-e2e-gemini-key"
 
     yield server, base_url
 
-    settings.ollama_base_url = original_ollama_url
+    settings.gemini_base_url = original_gemini_url
+    settings.gemini_api_key = original_gemini_key
     server.shutdown()
     server.server_close()
