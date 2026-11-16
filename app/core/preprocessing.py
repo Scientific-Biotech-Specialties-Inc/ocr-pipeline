@@ -155,16 +155,22 @@ def _warp(gray: np.ndarray, corners: np.ndarray) -> np.ndarray:
                                borderMode=cv2.BORDER_REPLICATE)
 
 
+def normalize_illumination(gray: np.ndarray, kernel: int = 41) -> tuple[np.ndarray, np.ndarray]:
+    """Divide out a blurred background estimate, returning (flat_image, background)."""
+    kernel = kernel if kernel % 2 else kernel + 1
+    background = cv2.medianBlur(gray, kernel)
+    normalized = cv2.divide(gray, background, scale=255)
+    return np.clip(normalized, 0, 255).astype(np.uint8), background
+
+
 def remove_shadow(gray: np.ndarray, kernel: int = 41) -> np.ndarray:
     """Normalise uneven illumination by dividing out a blurred background.
 
     Division rather than subtraction is what produces the flat white page;
     subtraction leaves grey blotches where the shadow was.
     """
-    kernel = kernel if kernel % 2 else kernel + 1
-    background = cv2.medianBlur(gray, kernel)
-    normalized = cv2.divide(gray, background, scale=255)
-    return np.clip(normalized, 0, 255).astype(np.uint8)
+    flat, _ = normalize_illumination(gray, kernel=kernel)
+    return flat
 
 
 def upscale(gray: np.ndarray) -> np.ndarray:

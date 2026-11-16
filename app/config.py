@@ -45,6 +45,11 @@ class Settings(BaseSettings):
     # Image quality gate settings
     image_quality_blur_threshold: float = 80.0
     image_quality_brightness_floor: float = 40.0
+    # Faded receipt detection thresholds (shadow-normalized 0-255 ink depth)
+    image_quality_faded_max_ink_depth: float = 55.0
+    image_quality_faded_p95_ink_depth: float = 22.0
+    image_quality_faded_min_ink_ratio: float = 0.005
+    image_quality_faded_zone_ink_depth: float = 65.0
     # Orientation-independent size floors. Thermal receipts are often narrow
     # (short side ~200-300px) but still OCR cleanly; require both sides.
     image_quality_min_short_side: int = 200
