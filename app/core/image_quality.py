@@ -14,7 +14,7 @@ import numpy as np
 from PIL import Image
 
 from app.config import settings
-from app.core.preprocessing import correct_orientation, to_gray
+from app.core.preprocessing import correct_orientation, normalize_illumination, to_gray
 
 logger = logging.getLogger(__name__)
 
@@ -24,11 +24,12 @@ class QualityCheckResult:
     """Structured output from check_image_quality()."""
 
     passed: bool
-    rejection_code: str | None = None       # "blurry" | "too_dark" | "too_small" | None
+    rejection_code: str | None = None       # "blurry" | "too_dark" | "faded" | "too_small" | "not_a_receipt" | None
     rejection_reason: str | None = None     # Human-readable sentence for frontend
     blur_score: float = 0.0                    # Laplacian variance (higher = sharper)
     brightness: float = 0.0                    # Mean pixel value 0-255
     resolution: tuple[int, int] = (0, 0)       # (width, height) after orientation correction
+    contrast_score: float = 0.0                # 99th percentile shadow-normalized ink depth (0-255)
 
 
 NOT_A_RECEIPT_REASON = (
@@ -39,6 +40,11 @@ NOT_A_RECEIPT_REASON = (
 BLURRY_REASON = (
     "The uploaded image is too blurry to read the receipt details accurately. "
     "Please upload a clearer, focused photo or continue to enter the details manually."
+)
+
+FADED_REASON = (
+    "The receipt text is too faded or washed out to read accurately. "
+    "Please upload a clearer photo with better contrast or request a clearer copy of the receipt."
 )
 
 _face_cascade = None
@@ -120,13 +126,172 @@ def _check_non_receipt_heuristics(
     return False
 
 
+def _three_zone_slices(height: int, width: int) -> list[tuple[slice, slice]]:
+    """Return 3 equal slices along the longer image axis."""
+    if height >= width:
+        z_len = height // 3
+        return [
+            (slice(0, z_len), slice(None)),
+            (slice(z_len, 2 * z_len), slice(None)),
+            (slice(2 * z_len, height), slice(None)),
+        ]
+    z_len = width // 3
+    return [
+        (slice(None), slice(0, z_len)),
+        (slice(None), slice(z_len, 2 * z_len)),
+        (slice(None), slice(2 * z_len, width)),
+    ]
+
+
+def _compute_ink_contrast_stats(
+    gray: np.ndarray,
+    image: Image.Image | None = None,
+) -> tuple[float, float, float, list[tuple[float, float]], bool]:
+    """Measure shadow-normalized paper-masked ink depth and visible stroke ratio.
+
+    Normalizes uneven illumination first and restricts percentiles to the bright
+    paper region (eroding border halos) so dark table backgrounds do not masquerade
+    as legible text ink on a faded receipt. Also reports whether the bright region
+    is highly saturated (e.g., colorful sky/scenery rather than receipt paper).
+    """
+    h, w = gray.shape[:2]
+    max_side = max(h, w)
+    if max_side > 1600:
+        scale = 1600.0 / max_side
+        work = cv2.resize(
+            gray,
+            (max(1, int(w * scale)), max(1, int(h * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+    else:
+        work = gray
+
+    flat, bg = normalize_illumination(work)
+    ink = 255.0 - flat.astype(np.float32)
+
+    thresh = float(np.percentile(bg, 85)) * 0.78
+    mask = (bg >= thresh).astype(np.uint8)
+    eroded = cv2.erode(mask, np.ones((11, 11), np.uint8))
+
+    if float(np.mean(eroded)) >= 0.05:
+        active_mask = eroded > 0
+        selected = ink[active_mask]
+    elif float(np.mean(mask)) >= 0.05:
+        active_mask = mask > 0
+        selected = ink[active_mask]
+    else:
+        active_mask = np.ones_like(ink, dtype=bool)
+        selected = ink.ravel()
+
+    is_colorful_region = False
+    if image is not None and image.mode in ("RGB", "RGBA"):
+        rgb = np.array(image.convert("RGB"))
+        if max_side > 1600:
+            rgb = cv2.resize(
+                rgb,
+                (work.shape[1], work.shape[0]),
+                interpolation=cv2.INTER_AREA,
+            )
+        hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+        region_sat = float(np.mean(hsv[:, :, 1][active_mask]))
+        is_colorful_region = region_sat > settings.image_quality_max_saturation_mean
+
+    p99_ink = float(np.percentile(selected, 99))
+    p95_ink = float(np.percentile(selected, 95))
+    ink_ratio = float(np.mean(selected >= 40.0))
+
+    zh, zw = ink.shape[:2]
+    zone_stats: list[tuple[float, float]] = []
+    if min(zh, zw) >= 150:
+        for row_sl, col_sl in _three_zone_slices(zh, zw):
+            z_ink = ink[row_sl, col_sl]
+            z_mask = active_mask[row_sl, col_sl]
+            if z_ink.size == 0:
+                continue
+            z_sel = z_ink[z_mask] if float(np.mean(z_mask)) >= 0.05 else z_ink.ravel()
+            zone_stats.append((float(np.percentile(z_sel, 99)), float(np.mean(z_sel >= 40.0))))
+
+    return p99_ink, p95_ink, ink_ratio, zone_stats, is_colorful_region
+
+
+def _is_faded_metrics(
+    p99_ink: float,
+    p95_ink: float,
+    ink_ratio: float,
+    zone_stats: list[tuple[float, float]],
+    *,
+    is_colorful_region: bool = False,
+) -> bool:
+    """Return True when whole-image ink contrast is severely faded/washed out."""
+    if is_colorful_region:
+        return False
+    if p99_ink < settings.image_quality_faded_max_ink_depth:
+        return True
+    if (
+        p95_ink < settings.image_quality_faded_p95_ink_depth
+        and ink_ratio < settings.image_quality_faded_min_ink_ratio
+    ):
+        return True
+    # Only fall back to multi-zone fading when global peak contrast is already weak,
+    # avoiding false positives on colorful scenes or sparse crisp receipts with blank margins.
+    if p99_ink >= 90.0:
+        return False
+    faded_zones = sum(
+        1
+        for z_p99, z_ratio in zone_stats
+        if z_p99 < settings.image_quality_faded_max_ink_depth
+        or z_ratio < settings.image_quality_faded_min_ink_ratio
+    )
+    return faded_zones >= 2
+
+
+def is_faded_image(image: Image.Image) -> bool:
+    """Return True if an image fails the pre-OCR whole-image faded check."""
+    gray = to_gray(image)
+    if float(np.mean(gray)) < settings.image_quality_brightness_floor:
+        return False
+    p99_ink, p95_ink, ink_ratio, zone_stats, is_colorful = _compute_ink_contrast_stats(
+        gray, image=image
+    )
+    return _is_faded_metrics(
+        p99_ink, p95_ink, ink_ratio, zone_stats, is_colorful_region=is_colorful
+    )
+
+
+def has_faded_ink_signal(image: Image.Image) -> bool:
+    """Return True if the image or any vertical third shows washed-out/faded ink.
+
+    Used post-OCR (Tier 2) after CLAHE recovery so partially faded receipts that fail
+    to yield critical fields or legible text can be rejected as ``faded``.
+    """
+    gray = to_gray(image)
+    if float(np.mean(gray)) < settings.image_quality_brightness_floor:
+        return False
+    p99_ink, p95_ink, ink_ratio, zone_stats, is_colorful = _compute_ink_contrast_stats(
+        gray, image=image
+    )
+    if is_colorful:
+        return False
+    if _is_faded_metrics(
+        p99_ink, p95_ink, ink_ratio, zone_stats, is_colorful_region=is_colorful
+    ):
+        return True
+    if p99_ink < settings.image_quality_faded_zone_ink_depth and ink_ratio < 0.02:
+        return True
+    return any(
+        z_p99 < settings.image_quality_faded_zone_ink_depth and z_ratio < 0.02
+        for z_p99, z_ratio in zone_stats
+    )
+
+
 def check_image_quality(image: Image.Image) -> QualityCheckResult:
-    """Run size, blur, and brightness checks on a PIL receipt image.
+    """Run size, brightness, faded-ink, blur, and non-receipt checks on a PIL receipt image.
 
-    Checks are performed in priority order: size -> blur -> brightness -> non-receipt.
+    Checks are performed in priority order:
+    size -> too_dark -> faded -> blurry -> not_a_receipt.
 
-    Size, blur, and brightness are rotation-invariant and evaluated first before
-    running the slower orientation check.
+    Faded ink is evaluated before blur so bright washed-out thermal receipts with weak
+    edges are classified as ``faded`` rather than ``blurry``.
     """
     raw_w, raw_h = image.size
     short_side, long_side = min(raw_w, raw_h), max(raw_w, raw_h)
@@ -148,20 +313,54 @@ def check_image_quality(image: Image.Image) -> QualityCheckResult:
 
     gray = to_gray(image)
 
-    # 2. Blur check via Laplacian variance (rotation-invariant)
+    # 2. Brightness / Darkness check via mean pixel intensity (rotation-invariant)
+    brightness = float(np.mean(gray))
+    brightness_floor = settings.image_quality_brightness_floor
     blur_score = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    if brightness < brightness_floor:
+        reason = (
+            "Image is too dark or underexposed for clear OCR reading. "
+            "Please capture under better lighting conditions."
+        )
+        logger.info("Quality check failed [too_dark]: mean %.2f < floor %.2f", brightness, brightness_floor)
+        return QualityCheckResult(
+            passed=False,
+            rejection_code="too_dark",
+            rejection_reason=reason,
+            blur_score=round(blur_score, 2),
+            brightness=round(brightness, 2),
+            resolution=(raw_w, raw_h),
+        )
+
+    # 3. Faded ink check (evaluated before blur so faint thermal paper isn't mislabeled blurry)
+    p99_ink, p95_ink, ink_ratio, zone_stats, is_colorful = _compute_ink_contrast_stats(
+        gray, image=image
+    )
+    if _is_faded_metrics(
+        p99_ink, p95_ink, ink_ratio, zone_stats, is_colorful_region=is_colorful
+    ):
+        logger.info(
+            "Quality check failed [faded]: p99_ink=%.1f, p95_ink=%.1f, ink_ratio=%.4f",
+            p99_ink, p95_ink, ink_ratio,
+        )
+        return QualityCheckResult(
+            passed=False,
+            rejection_code="faded",
+            rejection_reason=FADED_REASON,
+            blur_score=round(blur_score, 2),
+            brightness=round(brightness, 2),
+            resolution=(raw_w, raw_h),
+            contrast_score=round(p99_ink, 2),
+        )
+
+    # 4. Blur check via Laplacian variance (rotation-invariant)
     blur_thresh = settings.image_quality_blur_threshold
 
     # Zone-aware blur check for tall receipts: camera tilt can cause one end to be out-of-focus
     is_tall = max(raw_w, raw_h) >= 2.0 * min(raw_w, raw_h)
     min_zone_score = blur_score
     if is_tall and min(raw_w, raw_h) >= 150:
-        if raw_h >= raw_w:
-            z_len = gray.shape[0] // 3
-            zones = [gray[0:z_len, :], gray[z_len:2*z_len, :], gray[2*z_len:, :]]
-        else:
-            z_len = gray.shape[1] // 3
-            zones = [gray[:, 0:z_len], gray[:, z_len:2*z_len], gray[:, 2*z_len:]]
+        zones = [gray[row_sl, col_sl] for row_sl, col_sl in _three_zone_slices(gray.shape[0], gray.shape[1])]
         zone_scores = [float(cv2.Laplacian(z, cv2.CV_64F).var()) for z in zones if z.size > 0]
         if zone_scores:
             min_zone_score = min(zone_scores)
@@ -178,28 +377,12 @@ def check_image_quality(image: Image.Image) -> QualityCheckResult:
             rejection_code="blurry",
             rejection_reason=reason,
             blur_score=round(effective_score, 2),
-            resolution=(raw_w, raw_h),
-        )
-
-    # 3. Brightness / Darkness check via mean pixel intensity (rotation-invariant)
-    brightness = float(np.mean(gray))
-    brightness_floor = settings.image_quality_brightness_floor
-    if brightness < brightness_floor:
-        reason = (
-            "Image is too dark or underexposed for clear OCR reading. "
-            "Please capture under better lighting conditions."
-        )
-        logger.info("Quality check failed [too_dark]: mean %.2f < floor %.2f", brightness, brightness_floor)
-        return QualityCheckResult(
-            passed=False,
-            rejection_code="too_dark",
-            rejection_reason=reason,
-            blur_score=round(blur_score, 2),
             brightness=round(brightness, 2),
             resolution=(raw_w, raw_h),
+            contrast_score=round(p99_ink, 2),
         )
 
-    # 4. Orientation and non-receipt visual & selfie check
+    # 5. Orientation and non-receipt visual & selfie check
     upright = correct_orientation(image)
     width, height = upright.size
     resolution = (width, height)
@@ -219,6 +402,7 @@ def check_image_quality(image: Image.Image) -> QualityCheckResult:
             blur_score=round(blur_score, 2),
             brightness=round(brightness, 2),
             resolution=resolution,
+            contrast_score=round(p99_ink, 2),
         )
 
     return QualityCheckResult(
@@ -226,4 +410,5 @@ def check_image_quality(image: Image.Image) -> QualityCheckResult:
         blur_score=round(blur_score, 2),
         brightness=round(brightness, 2),
         resolution=resolution,
+        contrast_score=round(p99_ink, 2),
     )

@@ -22,6 +22,7 @@ import functools
 import logging
 import time
 from io import BytesIO
+from typing import Callable
 
 import httpx
 from PIL import Image
@@ -44,7 +45,12 @@ from app.core.financial_semantics import (
     semantics_requested,
     validate_financial_semantics,
 )
-from app.core.image_quality import NOT_A_RECEIPT_REASON
+from app.core.image_quality import (
+    FADED_REASON,
+    NOT_A_RECEIPT_REASON,
+    has_faded_ink_signal,
+    is_faded_image,
+)
 from app.core.ocr_engine import (
     OcrBundle,
     OcrReading,
@@ -61,7 +67,7 @@ from app.core.segment_merger import (
     order_segments,
     split_tall_image_into_strips,
 )
-from app.core.verification import Verification, verify
+from app.core.verification import Verification, looks_illegible, verify
 from app.db.models import ReceiptEmbedding
 from app.db.mongodb import MongoDBClient
 from app.db.postgres import AsyncSessionLocal
@@ -131,6 +137,76 @@ def is_likely_receipt(bundle: OcrBundle, extraction: Extraction) -> bool:
     return bool(has_date and extraction.fields.get("vendor_name"))
 
 
+def _any_or_all_pages(
+    source_images: list[Image.Image],
+    check_fn: Callable[[Image.Image], bool],
+    *,
+    is_multi_page_pdf: bool,
+) -> bool:
+    """Use all() for multi-page PDFs (cover pages may be sparse) and any() otherwise."""
+    if not source_images:
+        return False
+    results = [check_fn(img) for img in source_images]
+    return all(results) if is_multi_page_pdf else any(results)
+
+
+def _is_post_ocr_faded(
+    source_images: list[Image.Image],
+    bundle: OcrBundle,
+    extraction: Extraction,
+    *,
+    likely_receipt: bool,
+    is_multi_page_pdf: bool,
+) -> bool:
+    """Return True when faded contrast caused OCR + CLAHE recovery to fail."""
+    if not _any_or_all_pages(
+        source_images, has_faded_ink_signal, is_multi_page_pdf=is_multi_page_pdf
+    ):
+        return False
+    if not likely_receipt:
+        return True
+    has_total = extraction.fields.get("total_amount") is not None
+    has_reconciled_items = bool(
+        extraction.item_scan
+        and (extraction.item_scan.reconciled or extraction.item_scan.near_reconciled)
+        and len(extraction.item_scan.items) >= 3
+    )
+    if not has_total and not has_reconciled_items:
+        return True
+    return looks_illegible(bundle.combined_text, bundle.confidence)
+
+
+async def _reject_post_ocr(
+    job_id: str,
+    receipt_id: int,
+    callback_url: str,
+    fields: dict,
+    *,
+    rejection_code: str,
+    rejection_reason: str,
+) -> None:
+    """Persist a post-OCR rejection in MongoDB and dispatch the rejection callback."""
+    await MongoDBClient.update_job_status(
+        job_id,
+        "rejected",
+        {
+            "status": "rejected",
+            "rejection_code": rejection_code,
+            "rejection_reason": rejection_reason,
+            "error": rejection_reason,
+        },
+    )
+    payload = build_callback_payload(
+        receipt_id=receipt_id,
+        fields=fields,
+        confidence=0.0,
+        status="rejected",
+        rejection_code=rejection_code,
+        rejection_reason=rejection_reason,
+    )
+    await send_callback(callback_url, payload.model_dump())
+
+
 async def process_receipt(
     job_id: str,
     receipt_id: int,
@@ -149,8 +225,11 @@ async def process_receipt(
         await MongoDBClient.update_job_status(job_id, "processing")
 
         raw_bytes_list: list[bytes] = []
-        is_multipart = bool(file_urls and len(file_urls) >= 2)
+        caller_multipart = bool(file_urls and len(file_urls) >= 2)
+        is_multipart = caller_multipart
         segment_images: list[Image.Image] = []
+        source_images: list[Image.Image] = []
+        is_multi_page_pdf = False
 
         if is_multipart:
             download_tasks = [download_file(url) for url in file_urls]  # type: ignore[union-attr]
@@ -161,6 +240,8 @@ async def process_receipt(
                     segment_images.append(imgs[0])
             if len(segment_images) < 2:
                 raise ValueError("Failed to load at least 2 valid image segments")
+
+            source_images = list(segment_images)
 
             # Sub-tile tall segments in multi-part uploads if virtual tiling is enabled
             if settings.ocr_virtual_tiling:
@@ -183,6 +264,8 @@ async def process_receipt(
             images = load_images(file_bytes, primary_url)
             if not images:
                 raise ValueError("No images extracted from file")
+            source_images = list(images)
+            is_multi_page_pdf = len(source_images) > 1
             # Auto-tiling for single tall images
             if settings.ocr_virtual_tiling and len(images) == 1:
                 strips = split_tall_image_into_strips(images[0])
@@ -190,6 +273,24 @@ async def process_receipt(
                     segment_images = strips
                     images = strips
                     is_multipart = True
+
+        # Reject whole-image faded receipts/PDFs before OCR or cache lookup (non-overridable).
+        if await asyncio.to_thread(
+            _any_or_all_pages,
+            source_images,
+            is_faded_image,
+            is_multi_page_pdf=is_multi_page_pdf,
+        ):
+            logger.warning("Job %s rejected pre-OCR in worker: faded receipt image", job_id)
+            await _reject_post_ocr(
+                job_id,
+                receipt_id,
+                callback_url,
+                {},
+                rejection_code="faded",
+                rejection_reason=FADED_REASON,
+            )
+            return
 
         content_hash = compute_content_hash(
             raw_bytes_list, country=country, currency=currency, location=location
@@ -259,30 +360,42 @@ async def process_receipt(
             gap_suspected = False
         t_ocr_total = time.perf_counter() - t0_ocr
 
-        if not force_process and not is_likely_receipt(bundle, extraction):
+        likely_receipt = is_likely_receipt(bundle, extraction)
+        if await asyncio.to_thread(
+            _is_post_ocr_faded,
+            source_images,
+            bundle,
+            extraction,
+            likely_receipt=likely_receipt,
+            is_multi_page_pdf=is_multi_page_pdf,
+        ):
+            logger.warning(
+                "Job %s rejected post-OCR: faded contrast left critical fields missing or illegible",
+                job_id,
+            )
+            await _reject_post_ocr(
+                job_id,
+                receipt_id,
+                callback_url,
+                dict(extraction.fields),
+                rejection_code="faded",
+                rejection_reason=FADED_REASON,
+            )
+            return
+
+        if not force_process and not likely_receipt:
             logger.warning(
                 "Job %s rejected: OCR output lacks receipt signals (money, keywords, tax id)",
                 job_id,
             )
-            await MongoDBClient.update_job_status(
+            await _reject_post_ocr(
                 job_id,
-                "rejected",
-                {
-                    "status": "rejected",
-                    "rejection_code": "not_a_receipt",
-                    "rejection_reason": NOT_A_RECEIPT_REASON,
-                    "error": NOT_A_RECEIPT_REASON,
-                },
-            )
-            payload = build_callback_payload(
-                receipt_id=receipt_id,
-                fields=dict(extraction.fields),
-                confidence=0.0,
-                status="rejected",
+                receipt_id,
+                callback_url,
+                dict(extraction.fields),
                 rejection_code="not_a_receipt",
                 rejection_reason=NOT_A_RECEIPT_REASON,
             )
-            await send_callback(callback_url, payload.model_dump())
             return
 
         near_reconciled = bool(extraction.item_scan and extraction.item_scan.near_reconciled)
