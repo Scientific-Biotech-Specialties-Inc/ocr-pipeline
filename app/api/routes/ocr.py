@@ -17,7 +17,7 @@ from app.api.schemas.ocr import (
 from app.config import settings
 from app.core.callback import send_callback
 from app.core.file_cache import cache_downloaded_bytes
-from app.core.image_quality import check_image_quality
+from app.core.image_quality import check_image_quality, select_quality_failure
 from app.db.mongodb import MongoDBClient
 from app.dependencies import verify_api_key
 from app.tasks.process_receipt import process_receipt_task
@@ -52,7 +52,7 @@ async def process_receipt(
     # Synchronous pre-OCR quality check.
     # Rejection is immediate (HTTP 422) — we also dispatch a callback if callback_url is present
     # so async consumers receive the rejection event.
-    # When force_process=True, non-faded warnings are bypassed, while "faded" remains enforced.
+    # All pre-OCR quality rejections are strictly non-overridable regardless of request.force_process.
     try:
         async def _check_one_segment(idx: int, url: str):
             if url.lower().split("?")[0].endswith(".pdf"):
@@ -67,15 +67,12 @@ async def process_receipt(
         segment_results = await asyncio.gather(*check_tasks)
         segment_results.sort(key=lambda x: x[0])
 
-        failing_item = next(
-            (item for item in segment_results if item[3] is not None and item[3].rejection_code == "faded"),
-            None,
+        failing_res = select_quality_failure(item[3] for item in segment_results)
+        failing_item = (
+            next((item for item in segment_results if item[3] is failing_res), None)
+            if failing_res is not None
+            else None
         )
-        if failing_item is None and not request.force_process:
-            failing_item = next(
-                (item for item in segment_results if item[3] is not None and not item[3].passed),
-                None,
-            )
 
         if failing_item is not None:
             idx, _url, _file_bytes, result = failing_item

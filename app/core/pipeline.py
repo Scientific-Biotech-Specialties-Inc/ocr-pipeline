@@ -34,6 +34,7 @@ from app.core.callback import send_callback
 from app.core.confidence import ConfidenceBreakdown, compute_confidence
 from app.core.extraction import Extraction, extract, fast_path_sufficient
 from app.core.file_cache import (
+    OCR_CACHE_VERSION,
     compute_content_hash,
     get_cached_ocr_result,
     pop_cached_bytes,
@@ -46,10 +47,12 @@ from app.core.financial_semantics import (
     validate_financial_semantics,
 )
 from app.core.image_quality import (
-    FADED_REASON,
     NOT_A_RECEIPT_REASON,
+    QualityCheckResult,
+    build_unreadable_reason,
+    check_image_quality,
     has_faded_ink_signal,
-    is_faded_image,
+    select_quality_failure,
 )
 from app.core.ocr_engine import (
     OcrBundle,
@@ -67,7 +70,14 @@ from app.core.segment_merger import (
     order_segments,
     split_tall_image_into_strips,
 )
-from app.core.verification import Verification, looks_illegible, verify
+from app.core.textquality import is_gobbly_vendor_name, looks_gobbly_ocr
+from app.core.verification import (
+    REASON_HANDWRITTEN,
+    REASON_NO_TOTAL,
+    Verification,
+    looks_illegible,
+    verify,
+)
 from app.db.models import ReceiptEmbedding
 from app.db.mongodb import MongoDBClient
 from app.db.postgres import AsyncSessionLocal
@@ -150,6 +160,31 @@ def _any_or_all_pages(
     return all(results) if is_multi_page_pdf else any(results)
 
 
+def _has_reconciled_items(extraction: Extraction) -> bool:
+    """Return True when >= 3 items reconciled (or near-reconciled) against an explicit target."""
+    scan = extraction.item_scan
+    return bool(
+        scan is not None
+        and scan.target is not None
+        and (scan.reconciled or scan.near_reconciled)
+        and len(scan.items) >= 3
+    )
+
+
+def _pre_ocr_quality_failure(
+    source_images: list[Image.Image],
+    *,
+    is_multi_page_pdf: bool,
+) -> QualityCheckResult | None:
+    """Run check_image_quality across pages/segments; multi-page PDFs fail only if all pages fail."""
+    if not source_images:
+        return None
+    results = [check_image_quality(img) for img in source_images]
+    if is_multi_page_pdf and any(res.passed for res in results):
+        return None
+    return select_quality_failure(results)
+
+
 def _is_post_ocr_faded(
     source_images: list[Image.Image],
     bundle: OcrBundle,
@@ -166,14 +201,115 @@ def _is_post_ocr_faded(
     if not likely_receipt:
         return True
     has_total = extraction.fields.get("total_amount") is not None
-    has_reconciled_items = bool(
-        extraction.item_scan
-        and (extraction.item_scan.reconciled or extraction.item_scan.near_reconciled)
-        and len(extraction.item_scan.items) >= 3
-    )
-    if not has_total and not has_reconciled_items:
+    if not has_total and not _has_reconciled_items(extraction):
         return True
     return looks_illegible(bundle.combined_text, bundle.confidence)
+
+
+def _is_valid_cached_ocr_result(cached_ocr: dict | None) -> bool:
+    """Validate cache schema version, field completeness, and OCR legibility."""
+    if not isinstance(cached_ocr, dict):
+        return False
+    if cached_ocr.get("cache_version") != OCR_CACHE_VERSION:
+        return False
+    callback_fields = cached_ocr.get("callback_fields") or {}
+    if callback_fields.get("total_amount") is None:
+        return False
+    vendor = callback_fields.get("vendor_name")
+    if not isinstance(vendor, str) or not vendor.strip() or is_gobbly_vendor_name(vendor):
+        return False
+    verification = (cached_ocr.get("job_document") or {}).get("verification") or {}
+    review_reasons = verification.get("review_reasons") or []
+    if REASON_HANDWRITTEN in review_reasons or REASON_NO_TOTAL in review_reasons:
+        return False
+    combined_text = cached_ocr.get("combined_text", "")
+    confidence = float(cached_ocr.get("confidence") or 0.0)
+    if looks_illegible(combined_text, confidence):
+        return False
+    return True
+
+
+def _evaluate_post_ocr_rejection(
+    source_images: list[Image.Image],
+    bundle: OcrBundle,
+    extraction: Extraction,
+    *,
+    likely_receipt: bool,
+    is_multi_page_pdf: bool,
+) -> tuple[str, str] | None:
+    """Evaluate fast post-OCR faded and non-receipt rejection gates before verify()."""
+    illegible = looks_illegible(bundle.combined_text, bundle.confidence)
+    gobbly = looks_gobbly_ocr(bundle.primary.text, bundle.primary.confidence)
+    if _is_post_ocr_faded(
+        source_images,
+        bundle,
+        extraction,
+        likely_receipt=likely_receipt,
+        is_multi_page_pdf=is_multi_page_pdf,
+    ):
+        return (
+            "faded",
+            build_unreadable_reason(
+                extraction.fields,
+                is_faded=True,
+                is_illegible=illegible,
+                is_gobbly=gobbly,
+            ),
+        )
+    if not likely_receipt:
+        return ("not_a_receipt", NOT_A_RECEIPT_REASON)
+    return None
+
+
+def _evaluate_post_verify_rejection(
+    bundle: OcrBundle,
+    extraction: Extraction,
+    verification: Verification,
+) -> tuple[str, str] | None:
+    """Evaluate post-verify completeness, grounding, and gobbly-OCR rejection gates."""
+    fields = verification.fields
+    total_missing = fields.get("total_amount") is None
+    tx_date = fields.get("transaction_date")
+    date_missing = not isinstance(tx_date, str) or not tx_date.strip()
+    vendor = fields.get("vendor_name")
+    vendor_missing = not isinstance(vendor, str) or not vendor.strip()
+    vendor_gobbly = not vendor_missing and is_gobbly_vendor_name(vendor)
+    vendor_invalid = vendor_missing or vendor_gobbly
+    missing_count = int(total_missing) + int(date_missing) + int(vendor_invalid)
+
+    has_reconciled_items = _has_reconciled_items(extraction)
+    is_reconciled = bool(extraction.reconciled or has_reconciled_items)
+
+    combined_illegible = looks_illegible(bundle.combined_text, bundle.confidence)
+    primary_gobbly = looks_gobbly_ocr(bundle.primary.text, bundle.primary.confidence)
+
+    critical_rejected = any(
+        key == field or key.startswith(f"{field} ")
+        for key in verification.rejected
+        for field in ("total_amount", "transaction_date", "vendor_name")
+    )
+
+    should_reject = (
+        (total_missing and not has_reconciled_items)
+        or (vendor_invalid and (not is_reconciled or missing_count >= 2))
+        or (missing_count >= 2)
+        or critical_rejected
+        or combined_illegible
+        or (primary_gobbly and not is_reconciled)
+    )
+    if not should_reject:
+        return None
+
+    return (
+        "unreadable",
+        build_unreadable_reason(
+            fields,
+            is_faded=False,
+            is_illegible=combined_illegible,
+            is_gobbly=primary_gobbly or vendor_gobbly,
+            rejected_fields=verification.rejected.keys(),
+        ),
+    )
 
 
 async def _reject_post_ocr(
@@ -274,21 +410,23 @@ async def process_receipt(
                     images = strips
                     is_multipart = True
 
-        # Reject whole-image faded receipts/PDFs before OCR or cache lookup (non-overridable).
-        if await asyncio.to_thread(
-            _any_or_all_pages,
+        # Reject receipts/PDFs that fail pre-OCR quality checks before OCR or cache lookup (non-overridable).
+        quality_failure = await asyncio.to_thread(
+            _pre_ocr_quality_failure,
             source_images,
-            is_faded_image,
             is_multi_page_pdf=is_multi_page_pdf,
-        ):
-            logger.warning("Job %s rejected pre-OCR in worker: faded receipt image", job_id)
+        )
+        if quality_failure is not None:
+            rej_code = quality_failure.rejection_code or "quality_failed"
+            rej_reason = quality_failure.rejection_reason or "Image quality check failed."
+            logger.warning("Job %s rejected pre-OCR in worker (code=%s)", job_id, rej_code)
             await _reject_post_ocr(
                 job_id,
                 receipt_id,
                 callback_url,
                 {},
-                rejection_code="faded",
-                rejection_reason=FADED_REASON,
+                rejection_code=rej_code,
+                rejection_reason=rej_reason,
             )
             return
 
@@ -298,7 +436,7 @@ async def process_receipt(
 
         if not force_process:
             cached_ocr = await get_cached_ocr_result(content_hash)
-            if cached_ocr is not None:
+            if _is_valid_cached_ocr_result(cached_ocr):
                 logger.info("Bypassing OCR pipeline via 90-day hash cache hit (job=%s)", job_id)
                 combined_text = cached_ocr.get("combined_text", "")
                 t0_embed = time.perf_counter()
@@ -347,6 +485,12 @@ async def process_receipt(
                     raise RuntimeError(f"Callback failed to {callback_url}")
                 logger.info("Job %s completed via 90-day cache hit (t_embed=%.3fs, t_dup=%.3fs)", job_id, t_embed, t_dup)
                 return
+            elif cached_ocr is not None:
+                logger.info(
+                    "Ignoring stale/incomplete 90-day cache hit (job=%s, cache_version=%s)",
+                    job_id,
+                    cached_ocr.get("cache_version"),
+                )
 
         t0_ocr = time.perf_counter()
         if is_multipart:
@@ -361,40 +505,28 @@ async def process_receipt(
         t_ocr_total = time.perf_counter() - t0_ocr
 
         likely_receipt = is_likely_receipt(bundle, extraction)
-        if await asyncio.to_thread(
-            _is_post_ocr_faded,
+        post_ocr_rejection = await asyncio.to_thread(
+            _evaluate_post_ocr_rejection,
             source_images,
             bundle,
             extraction,
             likely_receipt=likely_receipt,
             is_multi_page_pdf=is_multi_page_pdf,
-        ):
+        )
+        if post_ocr_rejection is not None:
+            rej_code, rej_reason = post_ocr_rejection
             logger.warning(
-                "Job %s rejected post-OCR: faded contrast left critical fields missing or illegible",
+                "Job %s rejected post-OCR (code=%s)",
                 job_id,
+                rej_code,
             )
             await _reject_post_ocr(
                 job_id,
                 receipt_id,
                 callback_url,
                 dict(extraction.fields),
-                rejection_code="faded",
-                rejection_reason=FADED_REASON,
-            )
-            return
-
-        if not force_process and not likely_receipt:
-            logger.warning(
-                "Job %s rejected: OCR output lacks receipt signals (money, keywords, tax id)",
-                job_id,
-            )
-            await _reject_post_ocr(
-                job_id,
-                receipt_id,
-                callback_url,
-                dict(extraction.fields),
-                rejection_code="not_a_receipt",
-                rejection_reason=NOT_A_RECEIPT_REASON,
+                rejection_code=rej_code,
+                rejection_reason=rej_reason,
             )
             return
 
@@ -421,6 +553,26 @@ async def process_receipt(
             reconciled=extraction.reconciled,
             locale_certainty=extraction.locale.certainty if extraction.locale else 0.0,
         )
+
+        post_verify_rejection = _evaluate_post_verify_rejection(
+            bundle, extraction, verification
+        )
+        if post_verify_rejection is not None:
+            rej_code, rej_reason = post_verify_rejection
+            logger.warning(
+                "Job %s rejected post-verify (code=%s)",
+                job_id,
+                rej_code,
+            )
+            await _reject_post_ocr(
+                job_id,
+                receipt_id,
+                callback_url,
+                dict(verification.fields),
+                rejection_code=rej_code,
+                rejection_reason=rej_reason,
+            )
+            return
 
         t0_embed = time.perf_counter()
         embedding = None
@@ -489,6 +641,7 @@ async def process_receipt(
         # Cache valid extraction result in Redis for 90 days
         try:
             cache_data = {
+                "cache_version": OCR_CACHE_VERSION,
                 "job_document": _job_document(
                     bundle, extraction, verification, breakdown,
                     force_process=force_process,

@@ -7,6 +7,7 @@ running the resource-heavy OCR pipeline.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 import cv2
@@ -15,6 +16,7 @@ from PIL import Image
 
 from app.config import settings
 from app.core.preprocessing import correct_orientation, normalize_illumination, to_gray
+from app.core.textquality import is_gobbly_vendor_name
 
 logger = logging.getLogger(__name__)
 
@@ -34,18 +36,96 @@ class QualityCheckResult:
 
 NOT_A_RECEIPT_REASON = (
     "This image does not appear to be a receipt (e.g., a photo, selfie, or non-receipt document). "
-    "Please upload a clear photo of an official receipt or invoice, or continue manually if this is a valid expense document."
+    "Please upload a clear photo of an official receipt or invoice."
 )
 
 BLURRY_REASON = (
     "The uploaded image is too blurry to read the receipt details accurately. "
-    "Please upload a clearer, focused photo or continue to enter the details manually."
+    "Please upload a clearer, focused photo of the receipt."
 )
 
 FADED_REASON = (
     "The receipt text is too faded or washed out to read accurately. "
     "Please upload a clearer photo with better contrast or request a clearer copy of the receipt."
 )
+
+UNREADABLE_REASON = (
+    "The receipt is damaged, incomplete, or too unreadable to extract critical details accurately. "
+    "Please upload a clearer photo of the receipt."
+)
+
+_CRITICAL_FIELD_LABELS: tuple[tuple[str, str], ...] = (
+    ("total_amount", "Total Amount"),
+    ("transaction_date", "Transaction Date"),
+    ("vendor_name", "Merchant Name"),
+)
+
+
+def build_unreadable_reason(
+    fields: dict,
+    *,
+    is_faded: bool = False,
+    is_illegible: bool = False,
+    is_gobbly: bool = False,
+    rejected_fields: Iterable[str] | None = None,
+) -> str:
+    """Build a specific rejection reason naming missing critical fields and/or garbled OCR."""
+    data = fields or {}
+    rejected_set = set(rejected_fields or ())
+    missing: list[str] = []
+    for key, label in _CRITICAL_FIELD_LABELS:
+        val = data.get(key)
+        is_missing = val is None or (isinstance(val, str) and not val.strip())
+        is_rejected = key in rejected_set or any(
+            entry.startswith(f"{key} ") for entry in rejected_set
+        )
+        is_gobbly_vendor = (
+            key == "vendor_name" and not is_missing and is_gobbly_vendor_name(val)
+        )
+        if is_missing or is_rejected or is_gobbly_vendor:
+            missing.append(label)
+
+    missing_text = ", ".join(missing)
+    if is_faded:
+        if missing:
+            return (
+                "The receipt text is too faded or washed out to read critical details "
+                f"({missing_text}). Please upload a clearer photo with better contrast or "
+                "request a clearer copy of the receipt."
+            )
+        return FADED_REASON
+
+    garbled = is_illegible or is_gobbly
+    if missing and garbled:
+        return (
+            "The receipt is damaged, incomplete, or too unreadable to read critical details "
+            f"({missing_text}) due to garbled or illegible OCR text. "
+            "Please upload a clearer photo of the receipt."
+        )
+    if missing:
+        return (
+            "The receipt is damaged, incomplete, or too unreadable to read critical details "
+            f"({missing_text}). Please upload a clearer photo of the receipt."
+        )
+    if garbled:
+        return (
+            "The receipt is damaged, incomplete, or too unreadable because the extracted OCR text "
+            "is garbled or largely illegible. Please upload a clearer photo of the receipt."
+        )
+    return UNREADABLE_REASON
+
+
+def select_quality_failure(
+    results: Iterable[QualityCheckResult | None],
+) -> QualityCheckResult | None:
+    """Select the highest-priority failing quality result (`faded` first, then first failure)."""
+    failing = [res for res in results if res is not None and not res.passed]
+    if not failing:
+        return None
+    for res in failing:
+        if res.rejection_code == "faded":
+            return res
+    return failing[0]
 
 _face_cascade = None
 
@@ -230,6 +310,13 @@ def _is_faded_metrics(
     if (
         p95_ink < settings.image_quality_faded_p95_ink_depth
         and ink_ratio < settings.image_quality_faded_min_ink_ratio
+    ):
+        return True
+    # Catch regionally faded thermal receipts with weak body contrast and at least one
+    # severely faded zone (e.g., washed-out totals while a header/logo remains darker).
+    if p95_ink < 45.0 and any(
+        z_p99 < settings.image_quality_faded_zone_ink_depth and z_ratio < 0.02
+        for z_p99, z_ratio in zone_stats
     ):
         return True
     # Only fall back to multi-zone fading when global peak contrast is already weak,

@@ -111,23 +111,23 @@ async def test_printed_receipt_produces_a_confident_payload(harness, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_handwritten_receipt_abstains_and_is_flagged(harness, monkeypatch):
+async def test_handwritten_receipt_abstains_and_rejects_unreadable(harness, monkeypatch):
     await _run(harness, monkeypatch, "receipt 3.jpg", receipt_id=103)
 
-    assert harness.final_status == "completed"
+    assert harness.final_status == "rejected"
     payload = harness.payload
 
     # The handwritten amounts are absent from the OCR text, so no total may be
-    # invented. SERMS routes anything under 0.80 to 'flagged'.
+    # invented and the post-OCR gate strictly rejects the unreadable receipt.
+    assert payload["status"] == "rejected"
+    assert payload["rejection_code"] == "unreadable"
+    assert "Total Amount" in payload["rejection_reason"]
     assert payload["total_amount"] is None
-    assert payload["ocr_confidence_score"] < 0.80
+    assert payload["ocr_confidence_score"] == 0.0
     # The printed header is still readable, including the five-digit branch code.
     assert payload["tin"] == "303-124-202-00000"
     assert payload["vat_classification"] == "vat"
-
-    verification = harness.job_document["verification"]
-    assert verification["needs_manual_review"] is True
-    assert "total_amount_missing" in verification["review_reasons"]
+    assert harness.job_document["rejection_code"] == "unreadable"
 
 
 @pytest.mark.asyncio

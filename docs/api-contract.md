@@ -71,8 +71,8 @@ Submits a receipt for async processing. Accepts either a single `file_url` or a 
 **Response (422 Unprocessable Entity) — pre-OCR quality rejection:**
 
 Returned *synchronously* when the image fails size / brightness / faded / blur / non-receipt checks.
-In multi-segment requests, segments are checked in parallel and `segment_index` identifies the failing image.
-When `force_process` is not set, all quality failures reject synchronously with 422; when `force_process` is set, only `faded` remains strictly enforced (non-overridable).
+In multi-segment requests, segments are checked in parallel (`faded` is prioritized if any segment fails as `faded`, otherwise the first failing segment is reported) and `segment_index` identifies the failing image.
+All pre-OCR quality rejections (`too_small`, `blurry`, `too_dark`, `faded`, `not_a_receipt`) are **strictly non-overridable** regardless of `force_process`.
 **No Celery job is queued and no callback is sent** unless `callback_url` is supplied (in which case a rejection callback is also dispatched). The client must surface `message` / `rejection_reason` as a toast or
 modal. A MongoDB audit row is still written with `status: "rejected"`.
 
@@ -91,13 +91,12 @@ modal. A MongoDB audit row is still written with `status: "rejected"`.
 }
 ```
 
-`rejection_code` values: `too_small` | `blurry` | `too_dark` | `faded` | `not_a_receipt` | `quality_failed` | `duplicate`.
+`rejection_code` values: `too_small` | `blurry` | `too_dark` | `faded` | `not_a_receipt` | `unreadable` | `quality_failed` | `duplicate`.
 
-To bypass overridable quality gates (`too_small`, `blurry`, `too_dark`, `not_a_receipt`), resubmit with
-`"force_process": true` (`faded` and `duplicate` cannot be bypassed).
+Quality, non-receipt, `unreadable`, and `duplicate` rejections are strictly non-overridable (`force_process` does not bypass any pre-OCR or post-OCR rejection gate).
 
 ### POST Callback (Async)
-Sent to the provided `callback_url`.
+Sent to the provided `callback_url`. When post-OCR or post-verification evaluation rejects a receipt (`faded`, `not_a_receipt`, `unreadable`) or detects a duplicate (`duplicate`), `status` is `"rejected"` with `rejection_code` and a specific `rejection_reason` (for `faded` and `unreadable`, naming which critical fields failed to read: `Total Amount`, `Transaction Date`, `Merchant Name`, and/or garbled or illegible OCR text).
 ```json
 {
   "receipt_id": 42,
