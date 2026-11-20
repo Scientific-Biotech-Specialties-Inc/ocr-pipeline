@@ -16,7 +16,7 @@ import logging
 import cv2
 import numpy as np
 import pytesseract
-from PIL import Image
+from PIL import ExifTags, Image, ImageOps
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +34,21 @@ MIN_ORIENTATION_CONFIDENCE = 2.0
 # ---------------------------------------------------------------------------
 # individual stages
 # ---------------------------------------------------------------------------
+
+_EXIF_TRANSPOSE_ORIENTATIONS = frozenset({2, 3, 4, 5, 6, 7, 8})
+
+
+def apply_exif_orientation(image: Image.Image) -> Image.Image:
+    """Apply EXIF orientation once (idempotent); return image unchanged if missing or malformed."""
+    try:
+        orientation = image.getexif().get(ExifTags.Base.Orientation, 1)
+        if isinstance(orientation, int) and orientation not in _EXIF_TRANSPOSE_ORIENTATIONS:
+            return image
+        transposed = ImageOps.exif_transpose(image)
+        return transposed if transposed is not None else image
+    except Exception:  # noqa: BLE001
+        return image
+
 
 def to_gray(image: Image.Image) -> np.ndarray:
     array = np.array(image.convert("RGB"))[:, :, ::-1]

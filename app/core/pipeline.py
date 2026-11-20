@@ -65,6 +65,7 @@ from app.core.ocr_engine import (
 )
 from app.core.pdf_handler import pdf_to_images
 from app.core.postprocessing import normalize_extraction
+from app.core.preprocessing import apply_exif_orientation
 from app.core.segment_merger import (
     merge_segment_readings,
     order_segments,
@@ -125,7 +126,7 @@ async def download_file(url: str) -> bytes:
 def load_images(file_bytes: bytes, file_url: str) -> list[Image.Image]:
     if file_url.lower().split("?")[0].endswith(".pdf"):
         return pdf_to_images(file_bytes)[:MAX_PDF_PAGES]
-    return [Image.open(BytesIO(file_bytes))]
+    return [apply_exif_orientation(Image.open(BytesIO(file_bytes)))]
 
 
 def is_likely_receipt(bundle: OcrBundle, extraction: Extraction) -> bool:
@@ -320,18 +321,18 @@ async def _reject_post_ocr(
     *,
     rejection_code: str,
     rejection_reason: str,
+    quality_check: dict | None = None,
 ) -> None:
     """Persist a post-OCR rejection in MongoDB and dispatch the rejection callback."""
-    await MongoDBClient.update_job_status(
-        job_id,
-        "rejected",
-        {
-            "status": "rejected",
-            "rejection_code": rejection_code,
-            "rejection_reason": rejection_reason,
-            "error": rejection_reason,
-        },
-    )
+    extra_fields: dict = {
+        "status": "rejected",
+        "rejection_code": rejection_code,
+        "rejection_reason": rejection_reason,
+        "error": rejection_reason,
+    }
+    if quality_check is not None:
+        extra_fields["quality_check"] = quality_check
+    await MongoDBClient.update_job_status(job_id, "rejected", extra_fields)
     payload = build_callback_payload(
         receipt_id=receipt_id,
         fields=fields,
@@ -427,6 +428,14 @@ async def process_receipt(
                 {},
                 rejection_code=rej_code,
                 rejection_reason=rej_reason,
+                quality_check={
+                    "rejection_code": rej_code,
+                    "rejection_reason": rej_reason,
+                    "blur_score": quality_failure.blur_score,
+                    "brightness": quality_failure.brightness,
+                    "resolution": list(quality_failure.resolution),
+                    "detected_issues": list(quality_failure.detected_issues),
+                },
             )
             return
 

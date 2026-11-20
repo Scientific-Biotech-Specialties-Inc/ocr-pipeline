@@ -69,6 +69,19 @@ def _make_non_receipt_image() -> Image.Image:
     return Image.fromarray(arr, mode="RGB")
 
 
+def _make_undersized_non_receipt_image() -> Image.Image:
+    arr = np.zeros((180, 160, 3), dtype=np.uint8)
+    arr[:90, :, :] = [100, 180, 240]
+    arr[90:, :, :] = [30, 160, 40]
+    cv2.line(arr, (0, 90), (160, 90), (0, 0, 0), 3)
+    cv2.circle(arr, (80, 45), 20, (255, 255, 0), -1)
+    return Image.fromarray(arr, mode="RGB")
+
+
+def _make_all_gates_failed_image() -> Image.Image:
+    return Image.fromarray(np.full((180, 160, 3), [35, 5, 5], dtype=np.uint8), mode="RGB")
+
+
 def _make_partially_faded_image(width: int = 400, height: int = 900) -> Image.Image:
     arr = np.full((height, width), 225, dtype=np.uint8)
     for y in range(40, 560, 35):
@@ -1077,3 +1090,236 @@ async def test_worker_completes_when_primary_is_clean_and_supporting_tesseract_i
 
     assert callbacks[-1]["status"] == "completed"
     assert callbacks[-1]["total_amount"] == 234.00
+
+
+@pytest.mark.asyncio
+async def test_api_prioritizes_not_a_receipt_over_faded_and_other_failures():
+    faded_bytes = _png_bytes(_make_faded_image())
+    non_receipt_bytes = _png_bytes(_make_non_receipt_image())
+    blurry_bytes = _png_bytes(_make_blurry_image())
+    quality_failed_bytes = _png_bytes(_make_all_gates_failed_image())
+
+    async def fake_download(url: str) -> bytes:
+        if "seg1" in url:
+            return non_receipt_bytes
+        if "seg2" in url:
+            return quality_failed_bytes
+        if "seg3" in url:
+            return blurry_bytes
+        return faded_bytes
+
+    with (
+        patch("app.api.routes.ocr._download_file", side_effect=fake_download),
+        patch("app.api.routes.ocr.MongoDBClient.create_job", new=AsyncMock()),
+        patch("app.api.routes.ocr.send_callback", new=AsyncMock(return_value=True)),
+        patch("app.api.routes.ocr.cache_downloaded_bytes", new=AsyncMock()),
+        patch("app.api.routes.ocr.process_receipt_task.delay") as mock_delay,
+    ):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            res = await client.post(
+                "/api/ocr/process",
+                headers={"Authorization": f"Bearer {settings.serms_api_key}"},
+                json={
+                    "receipt_id": 720,
+                    "file_urls": [
+                        "https://example.test/seg0.png",
+                        "https://example.test/seg1.png",
+                        "https://example.test/seg2.png",
+                        "https://example.test/seg3.png",
+                    ],
+                    "callback_url": "https://serms.test/callback",
+                    "force_process": True,
+                },
+            )
+
+    assert res.status_code == 422
+    body = res.json()
+    assert body["rejection_code"] == "not_a_receipt"
+    assert body["segment_index"] == 1
+    mock_delay.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_api_prioritizes_quality_failed_over_faded_segment():
+    faded_bytes = _png_bytes(_make_faded_image())
+    quality_failed_bytes = _png_bytes(_make_all_gates_failed_image())
+
+    async def fake_download(url: str) -> bytes:
+        return quality_failed_bytes if "seg1" in url else faded_bytes
+
+    with (
+        patch("app.api.routes.ocr._download_file", side_effect=fake_download),
+        patch("app.api.routes.ocr.MongoDBClient.create_job", new=AsyncMock()),
+        patch("app.api.routes.ocr.send_callback", new=AsyncMock(return_value=True)),
+        patch("app.api.routes.ocr.cache_downloaded_bytes", new=AsyncMock()),
+        patch("app.api.routes.ocr.process_receipt_task.delay") as mock_delay,
+    ):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            res = await client.post(
+                "/api/ocr/process",
+                headers={"Authorization": f"Bearer {settings.serms_api_key}"},
+                json={
+                    "receipt_id": 724,
+                    "file_urls": [
+                        "https://example.test/seg0.png",
+                        "https://example.test/seg1.png",
+                    ],
+                    "callback_url": "https://serms.test/callback",
+                    "force_process": True,
+                },
+            )
+
+    assert res.status_code == 422
+    body = res.json()
+    assert body["rejection_code"] == "quality_failed"
+    assert body["segment_index"] == 1
+    mock_delay.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("other_code", ["blurry", "too_dark", "too_small"])
+async def test_api_prioritizes_faded_over_other_quality_failures(other_code: str):
+    other_bytes = _png_bytes(_image_for_code(other_code))
+    faded_bytes = _png_bytes(_make_faded_image())
+
+    async def fake_download(url: str) -> bytes:
+        return faded_bytes if "seg1" in url else other_bytes
+
+    with (
+        patch("app.api.routes.ocr._download_file", side_effect=fake_download),
+        patch("app.api.routes.ocr.MongoDBClient.create_job", new=AsyncMock()),
+        patch("app.api.routes.ocr.send_callback", new=AsyncMock(return_value=True)),
+        patch("app.api.routes.ocr.cache_downloaded_bytes", new=AsyncMock()),
+        patch("app.api.routes.ocr.process_receipt_task.delay") as mock_delay,
+    ):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            res = await client.post(
+                "/api/ocr/process",
+                headers={"Authorization": f"Bearer {settings.serms_api_key}"},
+                json={
+                    "receipt_id": 721,
+                    "file_urls": [
+                        "https://example.test/seg0.png",
+                        "https://example.test/seg1.png",
+                    ],
+                    "callback_url": "https://serms.test/callback",
+                    "force_process": True,
+                },
+            )
+
+    assert res.status_code == 422
+    body = res.json()
+    assert body["rejection_code"] == "faded"
+    assert body["segment_index"] == 1
+    mock_delay.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("img_factory", "expected_code", "expected_issues"),
+    [
+        (_make_tiny_image, "too_small", {"too_small", "too_dark", "blurry"}),
+        (_make_undersized_non_receipt_image, "not_a_receipt", {"too_small", "not_a_receipt"}),
+    ],
+)
+async def test_api_422_persists_detected_issues_without_exposing_in_http_or_callback(
+    img_factory,
+    expected_code: str,
+    expected_issues: set[str],
+):
+    img_bytes = _png_bytes(img_factory())
+    created_jobs: list[dict] = []
+    callbacks: list[dict] = []
+
+    async def fake_create_job(doc: dict):
+        created_jobs.append(doc)
+
+    async def fake_send_callback(_url: str, payload: dict) -> bool:
+        callbacks.append(payload)
+        return True
+
+    with (
+        patch("app.api.routes.ocr._download_file", new=AsyncMock(return_value=img_bytes)),
+        patch("app.api.routes.ocr.MongoDBClient.create_job", side_effect=fake_create_job),
+        patch("app.api.routes.ocr.send_callback", side_effect=fake_send_callback),
+        patch("app.api.routes.ocr.cache_downloaded_bytes", new=AsyncMock()),
+        patch("app.api.routes.ocr.process_receipt_task.delay") as mock_delay,
+    ):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            res = await client.post(
+                "/api/ocr/process",
+                headers={"Authorization": f"Bearer {settings.serms_api_key}"},
+                json={
+                    "receipt_id": 722,
+                    "file_url": "https://example.test/multi-issue.png",
+                    "callback_url": "https://serms.test/callback",
+                    "force_process": False,
+                },
+            )
+
+    assert res.status_code == 422
+    body = res.json()
+    assert body["rejection_code"] == expected_code
+    assert "detected_issues" not in body
+    mock_delay.assert_not_called()
+
+    assert len(callbacks) == 1
+    assert callbacks[0]["rejection_code"] == expected_code
+    assert "detected_issues" not in callbacks[0]
+
+    assert len(created_jobs) == 1
+    qc = created_jobs[0]["quality_check"]
+    assert qc["rejection_code"] == expected_code
+    assert expected_issues.issubset(qc["detected_issues"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("img_factory", "expected_code", "expected_issues"),
+    [
+        (_make_tiny_image, "too_small", {"too_small", "too_dark", "blurry"}),
+        (_make_dark_image, "too_dark", {"too_dark", "blurry"}),
+    ],
+)
+async def test_worker_pre_ocr_rejection_persists_detected_issues_in_mongodb(
+    img_factory,
+    expected_code: str,
+    expected_issues: set[str],
+):
+    bad_img = img_factory()
+    updates: list[tuple[str, dict]] = []
+    callbacks: list[dict] = []
+
+    async def fake_update(_job_id: str, status: str, extra_fields: dict | None = None):
+        updates.append((status, extra_fields or {}))
+
+    async def fake_callback(_url: str, payload: dict) -> bool:
+        callbacks.append(payload)
+        return True
+
+    with (
+        patch("app.core.pipeline.download_file", new=AsyncMock(return_value=b"%PDF-1.4")),
+        patch("app.core.pipeline.load_images", return_value=[bad_img]),
+        patch("app.core.pipeline._read_and_extract", new=AsyncMock()) as mock_ocr,
+        patch("app.core.pipeline.MongoDBClient.update_job_status", side_effect=fake_update),
+        patch("app.core.pipeline.send_callback", side_effect=fake_callback),
+    ):
+        await pipeline.process_receipt(
+            job_id=f"job-pre-issues-{expected_code}",
+            receipt_id=723,
+            file_url="https://example.test/receipt.pdf",
+            callback_url="https://serms.test/callback",
+            source_service="serms",
+            force_process=True,
+        )
+
+    mock_ocr.assert_not_called()
+    assert updates[-1][0] == "rejected"
+    extra = updates[-1][1]
+    assert extra["rejection_code"] == expected_code
+    assert "quality_check" in extra
+    qc = extra["quality_check"]
+    assert qc["rejection_code"] == expected_code
+    assert expected_issues.issubset(qc["detected_issues"])
+    assert callbacks[-1]["rejection_code"] == expected_code
+    assert "detected_issues" not in callbacks[-1]
