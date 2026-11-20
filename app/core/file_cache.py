@@ -20,6 +20,8 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
+OCR_CACHE_VERSION = 2
+
 _redis_client: aioredis.Redis | None = None
 _redis_warning_logged = False
 
@@ -102,7 +104,7 @@ def compute_content_hash(
     for b in file_bytes_list:
         hasher.update(b)
     provider_str = (llm_provider if llm_provider is not None else settings.llm_provider).lower().strip()
-    meta = f"|{country or ''}|{currency or ''}|{location or ''}|{provider_str}"
+    meta = f"|v{OCR_CACHE_VERSION}|{country or ''}|{currency or ''}|{location or ''}|{provider_str}"
     hasher.update(meta.encode("utf-8"))
     return hasher.hexdigest()
 

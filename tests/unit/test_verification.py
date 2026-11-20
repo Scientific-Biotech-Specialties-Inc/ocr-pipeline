@@ -4,6 +4,7 @@ Cases mirror real corpus behaviour: ungrounded values must be nulled rather than
 downgraded, and receipt 3's misread tax figure must not ship.
 """
 
+from app.core.textquality import is_gobbly_vendor_name, looks_gobbly_ocr
 from app.core.verification import (
     REASON_HANDWRITTEN,
     REASON_NO_TOTAL,
@@ -160,6 +161,69 @@ class TestLegibility:
 
     def test_empty_text_is_illegible(self):
         assert looks_illegible("", 0.0)
+
+    def test_numeric_heavy_paddle_receipt_is_legible(self):
+        paddle_text = (
+            "THANK YOU FOR RECOMMENDING US !\n"
+            "STATION # 5 SERV # 648\n"
+            "ORDER C10 A008763 18 : 42\n"
+            "1 TRKY BRGR / NO BUN 12.00\n"
+            "1 CHCKN POT PIE 11.50\n"
+            "1 SALAD 8.95\n"
+            "1 ICED TEA 3.00\n"
+            "UPUP HOUSEH $1.94\nT\n"
+            "OREO COOKIE $5.98\nFC\nCartwheel MfrCpn 0.50-\nFC\n"
+            "FOOD 35.45\n"
+            "TAX 3.19\n"
+            "TOTAL 38.64"
+        )
+        assert not looks_illegible(paddle_text, 0.99)
+        assert not looks_gobbly_ocr(paddle_text, 0.99)
+
+    def test_noisy_supporting_pass_does_not_mark_clean_receipt_illegible(self):
+        combined = (
+            "The Continent DC\n1110 Vermont Avenue Northwest\nWashington, DC 20005\n"
+            "Ordered: 10/19/24 3:06 PM\n1 Egusi $35.00\n1 Cassava Leaf $35.00\n"
+            "Subtotal $191.00\nTax $7.00\nTotal $234.00\n"
+            "» oi ~~ eo —\" ny CaS\n' { The Cont inenit OC ok tex <"
+        )
+        assert not looks_illegible(combined, 0.96)
+
+    def test_truncated_gobbly_paddle_receipt_detected(self):
+        r41_paddle = (
+            "5 / 21 / 2022   5   01   PM\nStore   1\nWET\nWet   Pets   a\n3695   W\nMcMuo\n72\n"
+            "www   wetp\nBill   To : +  Walk-in\nCashier   Jarred\nDescription   1\n"
+            "SF   BRINE   SHRIMP   E\nSUN   GARDEN   PAPA\nTAXES\nRECE\nAI\nint   Tendered  $ 20   00\n"
+            "ange   Given : $ 4   12\nCash  $  n0\nGuarantees  &  return   policie\n"
+            "posted   at   register   check\nThank   you !  Have   a   nice   da\n501962"
+        )
+        assert looks_gobbly_ocr(r41_paddle, 0.96)
+
+    def test_is_gobbly_vendor_name(self):
+        for bad in (
+            "Swag t",
+            "Wet Pets a",
+            "SF BRINE SHRIMP E",
+            "' { The Cont inenit DC Ya YA",
+            "Za SeyEN PEREZ CORN. ey",
+            "= SSS SSS SS Nm re eee a",
+            "",
+            None,
+        ):
+            assert is_gobbly_vendor_name(bad) is True, f"Expected gobbly: {bad!r}"
+
+        for good in (
+            "Jollibee",
+            "Jollibee Las Vegas",
+            "Ma & Pa’s Bake Shop",
+            "THANK YOU FOR RECOMMENDING US !",
+            "The Cont Iment DC",
+            "Entrek (B) Sdn.Bhd.",
+            "Safeway",
+            "Target",
+            "Corner Cafe",
+        ):
+            assert is_gobbly_vendor_name(good) is False, f"Expected valid: {good!r}"
 
 
 class TestCategoryCoercion:

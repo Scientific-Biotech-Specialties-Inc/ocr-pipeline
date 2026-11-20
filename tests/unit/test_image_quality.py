@@ -6,7 +6,16 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from app.core.image_quality import check_image_quality, has_faded_ink_signal, is_faded_image
+from app.core.image_quality import (
+    BLURRY_REASON,
+    FADED_REASON,
+    NOT_A_RECEIPT_REASON,
+    UNREADABLE_REASON,
+    build_unreadable_reason,
+    check_image_quality,
+    has_faded_ink_signal,
+    is_faded_image,
+)
 
 RECEIPTS_DIR = Path(__file__).resolve().parents[2] / "docs" / "receipts"
 
@@ -71,6 +80,8 @@ def test_blurry_image_rejected():
     assert result.passed is False
     assert result.rejection_code == "blurry"
     assert "too blurry to read the receipt details accurately" in result.rejection_reason
+    assert "continue" not in result.rejection_reason.lower()
+    assert "manually" not in result.rejection_reason.lower()
 
 
 def test_faded_washed_out_receipt_rejected_as_faded():
@@ -138,10 +149,14 @@ def test_all_sample_receipts_pass_faded_check():
         if path.suffix.lower() not in (".jpg", ".jpeg", ".png"):
             continue
         img = Image.open(path)
-        assert is_faded_image(img) is False, f"{path.name} falsely flagged by is_faded_image"
         if path.name in KNOWN_FADED_SAMPLES:
+            assert is_faded_image(img) is True, f"{path.name} expected to fail Tier 1 is_faded_image"
             assert has_faded_ink_signal(img) is True, f"{path.name} expected to trigger faded signal"
+            res = check_image_quality(img)
+            assert res.passed is False, f"{path.name} expected to fail check_image_quality"
+            assert res.rejection_code == "faded", f"{path.name} expected rejection_code='faded', got {res.rejection_code}"
         else:
+            assert is_faded_image(img) is False, f"{path.name} falsely flagged by is_faded_image"
             assert has_faded_ink_signal(img) is False, f"{path.name} falsely flagged by has_faded_ink_signal"
 
 
@@ -158,6 +173,59 @@ def test_colorful_non_document_rejected_as_not_a_receipt():
     assert result.passed is False
     assert result.rejection_code == "not_a_receipt"
     assert "does not appear to be a receipt" in result.rejection_reason
+    assert "continue" not in result.rejection_reason.lower()
+    assert "manually" not in result.rejection_reason.lower()
+
+
+def test_rejection_reasons_do_not_offer_manual_override():
+    for reason in (BLURRY_REASON, NOT_A_RECEIPT_REASON, FADED_REASON, UNREADABLE_REASON):
+        assert "continue" not in reason.lower()
+        assert "manually" not in reason.lower()
+
+
+def test_build_unreadable_reason_variants():
+    reason_faded_all = build_unreadable_reason({}, is_faded=True)
+    assert "too faded or washed out" in reason_faded_all.lower()
+    assert "Total Amount, Transaction Date, Merchant Name" in reason_faded_all
+
+    reason_faded_partial = build_unreadable_reason(
+        {"vendor_name": "ACME", "transaction_date": "2026-03-01", "total_amount": None},
+        is_faded=True,
+    )
+    assert "Total Amount" in reason_faded_partial
+    assert "Transaction Date" not in reason_faded_partial
+    assert "Merchant Name" not in reason_faded_partial
+
+    reason_faded_none_missing = build_unreadable_reason(
+        {"vendor_name": "ACME", "transaction_date": "2026-03-01", "total_amount": 100.0},
+        is_faded=True,
+    )
+    assert reason_faded_none_missing == FADED_REASON
+
+    reason_unreadable_both = build_unreadable_reason(
+        {"vendor_name": "ACME", "total_amount": None},
+        is_faded=False,
+        is_illegible=True,
+    )
+    assert "damaged, incomplete, or too unreadable" in reason_unreadable_both.lower()
+    assert "Total Amount, Transaction Date" in reason_unreadable_both
+    assert "Merchant Name" not in reason_unreadable_both
+    assert "illegible" in reason_unreadable_both.lower()
+
+    reason_unreadable_illegible_only = build_unreadable_reason(
+        {"vendor_name": "ACME", "transaction_date": "2026-03-01", "total_amount": 100.0},
+        is_faded=False,
+        is_illegible=True,
+    )
+    assert "damaged, incomplete, or too unreadable" in reason_unreadable_illegible_only.lower()
+    assert "illegible" in reason_unreadable_illegible_only.lower()
+
+    reason_unreadable_fallback = build_unreadable_reason(
+        {"vendor_name": "ACME", "transaction_date": "2026-03-01", "total_amount": 100.0},
+        is_faded=False,
+        is_illegible=False,
+    )
+    assert reason_unreadable_fallback == UNREADABLE_REASON
 
 
 def test_receipt_11_passes_quality_gate():

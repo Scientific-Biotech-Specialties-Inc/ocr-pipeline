@@ -18,6 +18,7 @@ from typing import Any
 
 from app.core.grounding import is_grounded
 from app.core.schema import DEFAULT_EXPENSE_CATEGORY, EXPENSE_CATEGORIES, MONEY_FIELDS
+from app.core.textquality import ocr_text_quality_stats
 
 # Reasons SERMS reviewers care about. Emitted alongside the score so a human knows
 # where to look instead of re-reading the whole receipt.
@@ -200,26 +201,21 @@ def _collect_reasons(
 
 
 def looks_illegible(ocr_text: str, mean_word_confidence: float) -> bool:
-    """Heuristic detector for handwriting and failed reads.
+    """Heuristic detector for handwriting, illegible tokens, and failed reads.
 
-    Handwritten forms come back as fragments of printed labels surrounded by
-    noise, so the signal is a low ratio of well-formed words plus low per-word
-    confidence. Cheap, and it only needs to be right about the extremes - the
-    money-side gates already catch the rest.
+    Evaluates non-numeric/non-punctuation text tokens so clean receipts rich in
+    prices, quantities, and spaced dates are not penalized, while flagging low
+    engine confidence or low alphabetic word ratio. Kept separate from
+    ``looks_gobbly_ocr`` so noisy secondary/supporting OCR passes (e.g.
+    Tesseract over countertop backgrounds) do not poison combined-text legibility.
     """
-    text = ocr_text.strip()
-    if not text:
+    stats = ocr_text_quality_stats(ocr_text)
+    if not stats["text_tokens"]:
         return True
 
-    words = re.findall(r"[A-Za-z]{2,}", text)
-    tokens = [token for token in re.split(r"\s+", text) if token]
-    if not tokens:
-        return True
-
-    word_ratio = len(words) / len(tokens)
     if mean_word_confidence and mean_word_confidence < MIN_WORD_CONFIDENCE:
         return True
-    return word_ratio < MIN_LEGIBLE_RATIO
+    return stats["word_ratio"] < MIN_LEGIBLE_RATIO
 
 
 def coerce_category(value: Any) -> str:
