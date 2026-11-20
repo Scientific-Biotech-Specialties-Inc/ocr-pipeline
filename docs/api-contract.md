@@ -70,11 +70,12 @@ Submits a receipt for async processing. Accepts either a single `file_url` or a 
 
 **Response (422 Unprocessable Entity) — pre-OCR quality rejection:**
 
-Returned *synchronously* when the image fails size / brightness / faded / blur / non-receipt checks.
-In multi-segment requests, segments are checked in parallel (`faded` is prioritized if any segment fails as `faded`, otherwise the first failing segment is reported) and `segment_index` identifies the failing image.
-All pre-OCR quality rejections (`too_small`, `blurry`, `too_dark`, `faded`, `not_a_receipt`) are **strictly non-overridable** regardless of `force_process`.
+Returned *synchronously* when the EXIF-normalized image fails size / brightness / faded / blur / non-receipt checks.
+On a single image, all applicable checks are evaluated: if all four pre-OCR gate groups fail (`too_small`, `too_dark` or `faded`, `blurry`, and `not_a_receipt`), the response reports `rejection_code: "quality_failed"` with a general quality/verification rejection message; otherwise a single code is chosen using the suppression and priority hierarchy `not_a_receipt > too_small > too_dark > faded > blurry` (`not_a_receipt` suppresses quality flags, and `too_dark` / `faded` suppress `blurry`).
+In multi-segment requests, segments are checked in parallel (`not_a_receipt` is prioritized first, then `quality_failed`, then `faded`, then the first failing segment) and `segment_index` identifies the reported failing image.
+All pre-OCR quality rejections (`too_small`, `blurry`, `too_dark`, `faded`, `not_a_receipt`, `quality_failed`) are **strictly non-overridable** regardless of `force_process`.
 **No Celery job is queued and no callback is sent** unless `callback_url` is supplied (in which case a rejection callback is also dispatched). The client must surface `message` / `rejection_reason` as a toast or
-modal. A MongoDB audit row is still written with `status: "rejected"`.
+modal. A MongoDB audit row is still written with `status: "rejected"`; raw triggered flags (`quality_check.detected_issues`) are persisted internally in MongoDB `quality_check` (both on FastAPI `422` rejections and worker pre-OCR rejections), while the HTTP `422` response and webhook callback payload schemas remain unchanged with a single `rejection_code`.
 
 ```json
 {

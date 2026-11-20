@@ -104,6 +104,7 @@ async def process_receipt(
                         "brightness": result.brightness,
                         "resolution": list(result.resolution),
                         "segment_index": segment_idx,
+                        "detected_issues": list(result.detected_issues),
                     },
                 })
             except Exception:
