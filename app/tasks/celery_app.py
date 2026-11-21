@@ -23,6 +23,8 @@ celery_app.conf.update(
     task_track_started=True,
     task_time_limit=3600,
     worker_concurrency=1,
+    # Pre-warming PaddleOCR + embedding models in worker_process_init exceeds Celery's 4s default.
+    worker_proc_alive_timeout=120,
 )
 
 
