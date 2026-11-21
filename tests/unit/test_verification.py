@@ -199,6 +199,37 @@ class TestLegibility:
         )
         assert looks_gobbly_ocr(r41_paddle, 0.96)
 
+    def test_grocery_pos_store_codes_and_long_receipt_isolated_noise_stay_legible(self):
+        # Mirrors Puregold grocery POS layout: '×', 'V' VAT flags, SKU codes, and
+        # isolated dot-matrix artifacts across a long receipt (>25 lines).
+        item_lines = [
+            "64.00 V",
+            "1 × 64.00",
+            "4800016522533 DRD PEV-CUT EP025G",
+            "125.50 V",
+            "1 × 125.50",
+            "480G523220987 MCBY CARAM PUF69G",
+            "88.00 V",
+            "1 × 88.00",
+            "SMART DW P-LEMON 500ML",
+        ] * 4
+        grocery_text = "\n".join(
+            [
+                "Puregold Price Club Inc",
+                "FAIRVIEW QUEZON CITY",
+                "VAT REG TIN 000-123-456-000",
+                "SALES INVOICE",
+                "Date 2026-07-30",
+                *item_lines,
+                "TffwyFinoyT ty450g",
+                "CAMPrwD",
+                "Subtotal 6213.70",
+                "Total Amt Due 6193.70",
+            ]
+        )
+        assert not looks_illegible(grocery_text, 0.80)
+        assert not looks_gobbly_ocr(grocery_text, 0.80)
+
     def test_is_gobbly_vendor_name(self):
         for bad in (
             "Swag t",

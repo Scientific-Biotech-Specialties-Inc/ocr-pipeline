@@ -587,6 +587,65 @@ async def test_worker_allows_real_target_reconciled_items_when_total_amount_none
 
 
 @pytest.mark.asyncio
+async def test_worker_flags_legible_receipt_missing_only_total_when_substantive_items_present():
+    # Mirrors QAD S-21: legible non-faded receipt with valid merchant + date + >=3 items
+    # but cut-off/unreadable footer total completes with needs_manual_review=True (flagged).
+    sharp_img = _make_sharp_image()
+    bundle = _make_bundle(
+        "Puregold Price Club Inc\nDate 2026-07-30\nCoffee 50.00 V\nToast 70.00 V\nJuice 80.00 V",
+        confidence=0.88,
+        anchors=AnchorScore(total=4.0, money_tokens=3, keyword_hits=1, has_tax_id=False, has_date=True),
+    )
+    item_scan = ItemScan(
+        items=[
+            ExtractedItem(name="Coffee", quantity=1, price=50.00),
+            ExtractedItem(name="Toast", quantity=1, price=70.00),
+            ExtractedItem(name="Juice", quantity=1, price=80.00),
+        ],
+        reconciled=False,
+        near_reconciled=True,
+        target=None,
+    )
+    extraction = Extraction(
+        fields={
+            "vendor_name": "Puregold Price Club Inc",
+            "transaction_date": "2026-07-30",
+            "total_amount": None,
+        },
+        item_scan=item_scan,
+    )
+    callbacks: list[dict] = []
+
+    async def fake_callback(_url: str, payload: dict) -> bool:
+        callbacks.append(payload)
+        return True
+
+    with (
+        patch("app.core.pipeline.download_file", new=AsyncMock(return_value=_png_bytes(sharp_img))),
+        patch("app.core.pipeline.get_cached_ocr_result", new=AsyncMock(return_value=None)),
+        patch("app.core.pipeline._read_and_extract", new=AsyncMock(return_value=(bundle, extraction, {}))),
+        patch("app.core.pipeline._store_embedding", new=AsyncMock()),
+        patch("app.core.pipeline._evaluate_duplicate", new=AsyncMock(return_value=(False, None, []))),
+        patch("app.core.pipeline.set_cached_ocr_result", new=AsyncMock()),
+        patch("app.core.pipeline.EmbeddingGenerator.generate", return_value=[0.1] * 384),
+        patch("app.core.pipeline.MongoDBClient.update_job_status", new=AsyncMock()),
+        patch("app.core.pipeline.send_callback", side_effect=fake_callback),
+    ):
+        await pipeline.process_receipt(
+            job_id="job-missing-total-substantive-items",
+            receipt_id=7091,
+            file_url="https://example.test/no_footer.png",
+            callback_url="https://serms.test/callback",
+            source_service="serms",
+            force_process=False,
+        )
+
+    assert callbacks[-1]["status"] == "completed"
+    assert callbacks[-1]["needs_manual_review"] is True
+    assert callbacks[-1]["ocr_confidence_score"] <= 0.50
+
+
+@pytest.mark.asyncio
 async def test_worker_rejects_illegible_ocr_output_as_unreadable_even_when_forced():
     sharp_img = _make_sharp_image()
     bundle = _make_bundle(

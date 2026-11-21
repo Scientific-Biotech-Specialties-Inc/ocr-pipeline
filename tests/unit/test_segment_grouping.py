@@ -1063,3 +1063,48 @@ def test_group_segments_keeps_tall_segment_virtual_strips_grouped_in_mixed_batch
     assert len(groups[1].segments) == 2
     assert groups[1].is_self_contained is True
     assert groups[1].total_amount == 150.0
+
+
+def test_group_segments_merges_footer_first_grocery_segments_with_trailing_bir_block():
+    img_bot = Image.new("RGB", (450, 800))
+    img_top = Image.new("RGB", (450, 800))
+    img_mid = Image.new("RGB", (450, 800))
+
+    r_bot = _make_reading([
+        "64.00 V",
+        "1 x 64.00",
+        "DRD PEV-CUT EP025G",
+        "125.50 V",
+        "1 x 125.50",
+        "MCBY CARAM PUF69G",
+        "88.00 V",
+        "1 x 88.00",
+        "SMART DW P-LEMON 500ML",
+        "VAT REG TIN 000-123-456-000",
+        "POS PTU MIN BIR PERMIT",
+    ])
+    r_top = _make_reading([
+        "Puregold Price Club Inc",
+        "VAT REG TIN 000-123-456-000",
+        "SALES INVOICE",
+        "Date: 2026-07-30",
+        "45.00 V",
+        "1 x 45.00",
+        "JERSEY EVAP 370ML",
+    ])
+    r_mid = _make_reading([
+        "55.00 V",
+        "1 x 55.00",
+        "MAGGI MGC ERP8GX16",
+        "72.00 V",
+        "1 x 72.00",
+        "MAYA HCM 590G",
+    ])
+
+    groups = group_segments_into_receipts([
+        (0, img_bot, r_bot),
+        (1, img_top, r_top),
+        (2, img_mid, r_mid),
+    ])
+    assert len(groups) == 1
+    assert groups[0].segment_indices == [0, 1, 2]
