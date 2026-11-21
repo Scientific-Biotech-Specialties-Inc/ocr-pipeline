@@ -15,7 +15,12 @@ MAX_MIXED_CASE_RATIO = 0.34
 
 _PUNCT_ONLY_RE = re.compile(r"^[\s/\\:;,.!?@#$%^&*()\-_=+\[\]{}|~`'\"<>]+$")
 _NUMERIC_OR_QTY_RE = re.compile(
-    r"^[$€£¥pP]?[-+]?\d[\d,./:%-]*[xX×*%-]*$|^[*Xx#]+\d*$"
+    r"^[$€£¥pP]?[-+]?\d[\d,./:%-]*[xX×*%-]*[VvEeZzTt]?$"
+    r"|^[*Xx#]+\d*$"
+    r"|^\d+[xX×]\d+(?:[.,]\d+)?[A-Za-z]?$"
+)
+_STORE_CODE_OR_SKU_TOKEN_RE = re.compile(
+    r"^(?:[A-Z0-9]*\d[A-Z0-9]*[A-Z][A-Z0-9-]*|[A-Z]{2,}[0-9]+[A-Z0-9-]*)$"
 )
 _ALPHA_WORD_RE = re.compile(r"[A-Za-z][A-Za-z.'&-]*")
 _KNOWN_UNIT_OR_TIME_RE = re.compile(
@@ -27,7 +32,7 @@ _KNOWN_TWO_CHAR_LINES = frozenset({
     "NO", "OK", "IN", "ON", "TO", "BY", "OF", "PM", "AM", "AT", "AS", "IS",
     "IT", "WE", "GO", "UP", "MY", "SG", "BN",
 })
-_POS_TAX_FLAG_LINES = frozenset({"T", "F", "N", "FC", "FT", "FN", "TX", "NT"})
+_POS_TAX_FLAG_LINES = frozenset({"V", "E", "Z", "T", "F", "N", "FC", "FT", "FN", "TX", "NT"})
 _VALID_TWO_CHAR_VENDOR_TOKENS = frozenset({
     "of", "in", "at", "by", "to", "on", "co", "us", "dc", "ph", "la",
     "el", "de", "mr", "ms", "dr", "st", "jr", "sr", "go", "up", "no",
@@ -151,7 +156,13 @@ def ocr_text_quality_stats(ocr_text: str) -> dict[str, Any]:
         core = tok.strip("()")
         if not core or _PUNCT_ONLY_RE.match(tok) or _PUNCT_ONLY_RE.match(core):
             continue
+        if not any(ch.isalnum() for ch in core):
+            continue
         if _NUMERIC_OR_QTY_RE.match(core):
+            continue
+        if core in _POS_TAX_FLAG_LINES:
+            continue
+        if _STORE_CODE_OR_SKU_TOKEN_RE.match(core.strip(".,:;!?\"'")):
             continue
         text_tokens.append(tok)
 
@@ -226,9 +237,15 @@ def looks_gobbly_ocr(ocr_text: str, mean_word_confidence: float = 1.0) -> bool:
     stats = ocr_text_quality_stats(ocr_text)
     if not stats["text_tokens"]:
         return True
-    if stats["noisy_sym_count"] >= 2 or stats["noisy_line_count"] >= 2:
+    line_count = max(stats["line_count"], 1)
+    # Short/truncated slips use flat counts; long receipts scale by line density so
+    # isolated dot-matrix artifacts in 100+ lines do not reject valid receipts.
+    is_long = line_count > 25
+    if stats["noisy_sym_count"] >= 2 and (not is_long or stats["noisy_sym_count"] / line_count >= 0.05):
         return True
-    if stats["case_flip_count"] >= 2:
+    if stats["noisy_line_count"] >= 2 and (not is_long or stats["noisy_line_count"] / line_count >= 0.05):
+        return True
+    if stats["case_flip_count"] >= 2 and (not is_long or stats["case_flip_count"] / line_count >= 0.05):
         return True
     if stats["gobbly_hits"] >= 3 and stats["gobbly_ratio"] >= 0.12:
         return True

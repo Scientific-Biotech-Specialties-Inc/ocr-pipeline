@@ -290,7 +290,15 @@ def _evaluate_post_verify_rejection(
     missing_count = int(total_missing) + int(date_missing) + int(vendor_invalid)
 
     has_reconciled_items = _has_reconciled_items(extraction)
+    has_substantive_items = bool(
+        extraction.item_scan is not None and len(extraction.item_scan.items) >= 3
+    )
     is_reconciled = bool(extraction.reconciled or has_reconciled_items)
+    # Allow a legible receipt missing only total_amount to complete as flagged
+    # (needs_manual_review=True) when >=3 items + merchant + date were extracted (QAD S-21).
+    can_flag_missing_total = has_reconciled_items or (
+        has_substantive_items and not vendor_invalid and not date_missing
+    )
 
     combined_illegible = looks_illegible(bundle.combined_text, bundle.confidence)
     primary_gobbly = looks_gobbly_ocr(bundle.primary.text, bundle.primary.confidence)
@@ -302,7 +310,7 @@ def _evaluate_post_verify_rejection(
     )
 
     should_reject = (
-        (total_missing and not has_reconciled_items)
+        (total_missing and not can_flag_missing_total)
         or (vendor_invalid and (not is_reconciled or missing_count >= 2))
         or (missing_count >= 2)
         or critical_rejected

@@ -20,6 +20,7 @@ from rapidfuzz import fuzz
 
 from app.core.anchors import DATE_RE, MONEY_RE, TAX_ID_RE, score_text
 from app.core.extraction import extract
+from app.core.items import looks_like_store_code
 from app.core.numbers import digits_only, normalize_money
 from app.core.ocr_engine import OcrBundle, OcrReading, Word
 from app.core.textquality import is_gobbly_vendor_name
@@ -585,11 +586,18 @@ def _evaluate_item_seam_overlap(
 
 
 def _header_region_lines(lines: list[str]) -> list[str]:
-    """Return lines from top of segment up to the first footer/total/ATP boundary."""
+    """Return lines from top of segment up to the first item-body or footer/ATP boundary."""
     header_lines: list[str] = []
+    item_rows = 0
     for line in lines:
         if _FOOTER_OR_ATP_START_RE.search(line) or _BARE_TOTAL_LINE_RE.match(line):
             break
+        if QTY_PRICE_RE.search(line) or PRICE_TAX_CODE_RE.search(line):
+            if not header_lines:
+                break
+            item_rows += 1
+            if item_rows >= 3:
+                break
         header_lines.append(line)
     return header_lines
 
@@ -604,7 +612,7 @@ def _validate_header_vendor(
     if not raw_vendor or not isinstance(raw_vendor, str):
         return None
     cleaned = raw_vendor.strip()
-    if not cleaned or is_gobbly_vendor_name(cleaned):
+    if not cleaned or is_gobbly_vendor_name(cleaned) or looks_like_store_code(cleaned):
         return None
     if _is_generic_boilerplate_line(cleaned):
         return None
