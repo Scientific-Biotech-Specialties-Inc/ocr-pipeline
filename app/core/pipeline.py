@@ -21,16 +21,22 @@ import asyncio
 import functools
 import logging
 import time
+from dataclasses import dataclass, field
 from io import BytesIO
 from typing import Callable
 
 import httpx
 from PIL import Image
 
-from app.api.schemas.ocr import build_callback_payload
+from app.api.schemas.ocr import (
+    SplitReceiptPayload,
+    build_callback_payload,
+    build_split_receipt_payload,
+)
 from app.config import settings
 from app.core.anchors import score_text
-from app.core.callback import send_callback
+from app.core.callback import send_callback, send_callback_with_response
+from app.core.categorize import _cosine
 from app.core.confidence import ConfidenceBreakdown, compute_confidence
 from app.core.extraction import Extraction, extract, fast_path_sufficient
 from app.core.file_cache import (
@@ -67,6 +73,8 @@ from app.core.pdf_handler import pdf_to_images
 from app.core.postprocessing import normalize_extraction
 from app.core.preprocessing import apply_exif_orientation
 from app.core.segment_merger import (
+    ReceiptSegmentGroup,
+    group_segments_into_receipts,
     merge_segment_readings,
     order_segments,
     split_tall_image_into_strips,
@@ -87,6 +95,9 @@ from app.embeddings.similarity import find_similar_receipts
 from app.llm.factory import create_provider
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_SEND_CALLBACK = send_callback
+_DEFAULT_SEND_CALLBACK_WITH_RESPONSE = send_callback_with_response
 
 DOWNLOAD_TIMEOUT = 30.0
 MAX_PDF_PAGES = 5
@@ -313,6 +324,362 @@ def _evaluate_post_verify_rejection(
     )
 
 
+async def _dispatch_callback_with_response(
+    callback_url: str, payload: dict
+) -> tuple[bool, dict | None]:
+    """Use ``send_callback_with_response`` while honoring tests that patch ``send_callback``."""
+    if (
+        send_callback is not _DEFAULT_SEND_CALLBACK
+        and send_callback_with_response is _DEFAULT_SEND_CALLBACK_WITH_RESPONSE
+    ):
+        ok = await send_callback(callback_url, payload)
+        return ok, None
+    return await send_callback_with_response(callback_url, payload)
+
+
+def _quality_check_dict(quality_failure: QualityCheckResult, *, segment_index: int | None = None) -> dict:
+    rej_code = quality_failure.rejection_code or "quality_failed"
+    rej_reason = quality_failure.rejection_reason or "Image quality check failed."
+    doc = {
+        "rejection_code": rej_code,
+        "rejection_reason": rej_reason,
+        "blur_score": quality_failure.blur_score,
+        "brightness": quality_failure.brightness,
+        "resolution": list(quality_failure.resolution),
+        "detected_issues": list(quality_failure.detected_issues),
+    }
+    if segment_index is not None:
+        doc["segment_index"] = segment_index
+    return doc
+
+
+def _verify_and_score(
+    bundle: OcrBundle,
+    extraction: Extraction,
+    *,
+    location: str | None = None,
+    gap_suspected: bool = False,
+) -> tuple[Verification, ConfidenceBreakdown]:
+    near_reconciled = bool(extraction.item_scan and extraction.item_scan.near_reconciled)
+    verification = verify(
+        extraction.as_dict(),
+        bundle.combined_text,
+        reconciled=extraction.reconciled,
+        locale_resolved=bool(extraction.locale and extraction.locale.resolved),
+        mean_word_confidence=bundle.confidence,
+        tax_id_ambiguous=_tax_id_ambiguous(extraction),
+        derived_fields=(
+            set(extraction.money.derived) if extraction.money else set()
+        ) | {"tax_basis", "financial_reconciliation_status", "needs_manual_review",
+             "reported_total", "computed_total", "total_discrepancy", "discount_type"}
+        | ({"location"} if location else set()),
+        near_reconciled=near_reconciled,
+        segment_gap=gap_suspected,
+    )
+    breakdown = compute_confidence(
+        verification,
+        anchor_score=bundle.primary.score,
+        mean_word_confidence=bundle.confidence,
+        reconciled=extraction.reconciled,
+        locale_certainty=extraction.locale.certainty if extraction.locale else 0.0,
+    )
+    return verification, breakdown
+
+
+def _build_callback_field_dict(
+    extraction: Extraction, verification: Verification
+) -> tuple[dict, str | None, str | None, bool | None]:
+    callback_fields = dict(verification.fields)
+    has_callback_semantics = bool(
+        extraction.financial_semantics
+        and extraction.financial_semantics.source in {"qwen", "ollama", "gemini", "llm"}
+    )
+    if not has_callback_semantics:
+        for key in ("tax_basis", "financial_reconciliation_status"):
+            callback_fields.pop(key, None)
+
+    needs_review = bool(
+        verification.needs_manual_review or extraction.fields.get("needs_manual_review", False)
+    )
+    fin_recon_status = extraction.fields.get("financial_reconciliation_status")
+    tax_basis_val = extraction.fields.get("tax_basis") if has_callback_semantics else None
+    return (
+        callback_fields,
+        tax_basis_val,
+        fin_recon_status if has_callback_semantics else None,
+        needs_review if needs_review else None,
+    )
+
+
+async def _generate_embedding(combined_text: str, receipt_label: int | str) -> list[float] | None:
+    if not combined_text.strip():
+        return None
+    try:
+        embed_text = compact_text_for_embedding(combined_text)
+        return await asyncio.to_thread(EmbeddingGenerator.generate, embed_text)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Embedding generation failed for receipt %s: %s", receipt_label, exc)
+        return None
+
+
+def _extract_split_receipt_ids(response_body: dict | None) -> list[int]:
+    if not isinstance(response_body, dict):
+        return []
+    data_obj = response_body.get("data")
+    if not isinstance(data_obj, dict):
+        return []
+    raw_ids = data_obj.get("split_receipt_ids")
+    if not isinstance(raw_ids, list):
+        return []
+    parsed: list[int] = []
+    for rid in raw_ids:
+        if isinstance(rid, int) and not isinstance(rid, bool):
+            parsed.append(rid)
+        elif isinstance(rid, str) and rid.isdigit():
+            parsed.append(int(rid))
+    return parsed
+
+
+@dataclass
+class _ProcessedGroup:
+    segment_indices: list[int]
+    status: str
+    fields: dict = field(default_factory=dict)
+    confidence: float = 0.0
+    items: list[dict] = field(default_factory=list)
+    rejection_code: str | None = None
+    rejection_reason: str | None = None
+    is_duplicate: bool = False
+    duplicate_similarity: float | None = None
+    tax_basis: str | None = None
+    financial_reconciliation_status: str | None = None
+    needs_manual_review: bool | None = None
+    combined_text: str = ""
+    embedding: list[float] | None = None
+    job_doc: dict = field(default_factory=dict)
+    reached_completion: bool = False
+
+
+async def _process_multi_group_batch(
+    *,
+    job_id: str,
+    receipt_id: int,
+    callback_url: str,
+    source_service: str,
+    force_process: bool,
+    source_images: list[Image.Image],
+    groups: list[ReceiptSegmentGroup],
+    failing_entries: list[tuple[int, QualityCheckResult]],
+    country: str | None,
+    currency: str | None,
+    location: str | None,
+) -> None:
+    """Process >=2 receipt groups independently, check intra-batch duplicates, and dispatch split callback."""
+    processed_groups: list[_ProcessedGroup] = []
+    prior_embeddings: list[list[float]] = []
+
+    for group in groups:
+        bundle, extraction, _metrics, gap_suspected = await _extract_ordered_segment_group(
+            group.segments,
+            caller_country=country,
+            caller_currency=currency,
+            caller_location=location,
+        )
+        group_source_images = [
+            source_images[idx] for idx in group.segment_indices if idx < len(source_images)
+        ] or [img for img, _ in group.segments]
+
+        likely_receipt = is_likely_receipt(bundle, extraction)
+        post_ocr_rejection = await asyncio.to_thread(
+            _evaluate_post_ocr_rejection,
+            group_source_images,
+            bundle,
+            extraction,
+            likely_receipt=likely_receipt,
+            is_multi_page_pdf=False,
+        )
+        if post_ocr_rejection is not None:
+            rej_code, rej_reason = post_ocr_rejection
+            processed_groups.append(
+                _ProcessedGroup(
+                    segment_indices=list(group.segment_indices),
+                    status="rejected",
+                    fields=dict(extraction.fields),
+                    rejection_code=rej_code,
+                    rejection_reason=rej_reason,
+                    job_doc={
+                        "segment_indices": list(group.segment_indices),
+                        "status": "rejected",
+                        "rejection_code": rej_code,
+                        "rejection_reason": rej_reason,
+                    },
+                )
+            )
+            continue
+
+        verification, breakdown = _verify_and_score(
+            bundle, extraction, location=location, gap_suspected=gap_suspected
+        )
+        post_verify_rejection = _evaluate_post_verify_rejection(
+            bundle, extraction, verification
+        )
+        if post_verify_rejection is not None:
+            rej_code, rej_reason = post_verify_rejection
+            processed_groups.append(
+                _ProcessedGroup(
+                    segment_indices=list(group.segment_indices),
+                    status="rejected",
+                    fields=dict(verification.fields),
+                    rejection_code=rej_code,
+                    rejection_reason=rej_reason,
+                    job_doc={
+                        "segment_indices": list(group.segment_indices),
+                        "status": "rejected",
+                        "rejection_code": rej_code,
+                        "rejection_reason": rej_reason,
+                    },
+                )
+            )
+            continue
+
+        embedding = await _generate_embedding(
+            bundle.combined_text, f"{receipt_id}:{group.segment_indices}"
+        )
+        is_dup, dup_score, matches = await _evaluate_duplicate(
+            receipt_id, source_service, bundle.combined_text, embedding
+        )
+        if embedding is not None:
+            for prev_emb in prior_embeddings:
+                sim = _cosine(embedding, prev_emb)
+                if sim >= settings.duplicate_similarity_threshold:
+                    is_dup = True
+                    dup_score = max(dup_score, sim) if dup_score is not None else sim
+            prior_embeddings.append(embedding)
+
+        callback_fields, tax_basis_val, fin_recon_status, needs_review = _build_callback_field_dict(
+            extraction, verification
+        )
+        group_doc = _job_document(
+            bundle,
+            extraction,
+            verification,
+            breakdown,
+            force_process=force_process,
+            is_duplicate=is_dup,
+            duplicate_similarity=dup_score,
+            matches_count=len(matches),
+        )
+        group_doc["segment_indices"] = list(group.segment_indices)
+        processed_groups.append(
+            _ProcessedGroup(
+                segment_indices=list(group.segment_indices),
+                status="rejected" if is_dup else "completed",
+                fields=callback_fields,
+                confidence=breakdown.score,
+                items=extraction.item_scan.payload() if extraction.item_scan else [],
+                rejection_code="duplicate" if is_dup else None,
+                rejection_reason=(
+                    "Duplicate receipt detected based on semantic similarity." if is_dup else None
+                ),
+                is_duplicate=is_dup,
+                duplicate_similarity=dup_score,
+                tax_basis=tax_basis_val,
+                financial_reconciliation_status=fin_recon_status,
+                needs_manual_review=needs_review,
+                combined_text=bundle.combined_text,
+                embedding=embedding,
+                job_doc=group_doc,
+                reached_completion=True,
+            )
+        )
+
+    for bad_idx, bad_qc in failing_entries:
+        qc_dict = _quality_check_dict(bad_qc, segment_index=bad_idx)
+        processed_groups.append(
+            _ProcessedGroup(
+                segment_indices=[bad_idx],
+                status="rejected",
+                rejection_code=qc_dict["rejection_code"],
+                rejection_reason=qc_dict["rejection_reason"],
+                job_doc={
+                    "segment_indices": [bad_idx],
+                    "status": "rejected",
+                    "rejection_code": qc_dict["rejection_code"],
+                    "rejection_reason": qc_dict["rejection_reason"],
+                    "quality_check": qc_dict,
+                },
+            )
+        )
+
+    primary = processed_groups[0]
+    split_payloads: list[SplitReceiptPayload] = [
+        build_split_receipt_payload(
+            segment_indices=g.segment_indices,
+            fields=g.fields,
+            confidence=g.confidence,
+            status=g.status,
+            items=g.items,
+            rejection_code=g.rejection_code,
+            rejection_reason=g.rejection_reason,
+            is_duplicate=g.is_duplicate,
+            duplicate_similarity=g.duplicate_similarity,
+            tax_basis=g.tax_basis,
+            financial_reconciliation_status=g.financial_reconciliation_status,
+            needs_manual_review=g.needs_manual_review,
+        )
+        for g in processed_groups[1:]
+    ]
+    payload = build_callback_payload(
+        receipt_id=receipt_id,
+        fields=primary.fields,
+        confidence=primary.confidence,
+        status=primary.status,
+        items=primary.items,
+        rejection_code=primary.rejection_code,
+        rejection_reason=primary.rejection_reason,
+        is_duplicate=primary.is_duplicate,
+        duplicate_similarity=primary.duplicate_similarity,
+        tax_basis=primary.tax_basis,
+        financial_reconciliation_status=primary.financial_reconciliation_status,
+        needs_manual_review=primary.needs_manual_review,
+        segment_indices=primary.segment_indices,
+        split_receipts=split_payloads,
+    )
+
+    any_reached_completion = any(g.reached_completion for g in processed_groups)
+    mongo_doc = dict(primary.job_doc)
+    mongo_doc["segment_indices"] = list(primary.segment_indices)
+    mongo_doc["group_count"] = len(processed_groups)
+    mongo_doc["split_receipts"] = [g.job_doc for g in processed_groups[1:]]
+    await MongoDBClient.update_job_status(
+        job_id,
+        "completed" if any_reached_completion else "rejected",
+        mongo_doc,
+    )
+
+    ok, resp_body = await _dispatch_callback_with_response(callback_url, payload.model_dump())
+    if not ok:
+        raise RuntimeError(f"Callback failed to {callback_url}")
+
+    if primary.status == "completed" and primary.combined_text.strip():
+        await _store_embedding(receipt_id, source_service, primary.combined_text, primary.embedding)
+
+    split_receipt_ids = _extract_split_receipt_ids(resp_body)
+    for split_group, child_id in zip(processed_groups[1:], split_receipt_ids):
+        if split_group.status == "completed" and split_group.combined_text.strip():
+            await _store_embedding(
+                child_id, source_service, split_group.combined_text, split_group.embedding
+            )
+
+    logger.info(
+        "Job %s split into %d receipt groups (primary=%s, splits=%d)",
+        job_id,
+        len(processed_groups),
+        primary.status,
+        len(split_payloads),
+    )
+
+
 async def _reject_post_ocr(
     job_id: str,
     receipt_id: int,
@@ -367,8 +734,10 @@ async def process_receipt(
         segment_images: list[Image.Image] = []
         source_images: list[Image.Image] = []
         is_multi_page_pdf = False
+        precomputed_group_segments: list[tuple[Image.Image, OcrReading]] | None = None
+        t_fast_ocr = 0.0
 
-        if is_multipart:
+        if caller_multipart:
             download_tasks = [download_file(url) for url in file_urls]  # type: ignore[union-attr]
             raw_bytes_list = list(await asyncio.gather(*download_tasks))
             for b, url in zip(raw_bytes_list, file_urls):  # type: ignore[union-attr]
@@ -380,20 +749,142 @@ async def process_receipt(
 
             source_images = list(segment_images)
 
-            # Sub-tile tall segments in multi-part uploads if virtual tiling is enabled
-            if settings.ocr_virtual_tiling:
-                expanded_segments: list[Image.Image] = []
-                for s_idx, s_img in enumerate(segment_images):
+            quality_results = await asyncio.to_thread(
+                lambda: [check_image_quality(img) for img in source_images]
+            )
+            passing_indices = [i for i, res in enumerate(quality_results) if res.passed]
+            failing_entries = [(i, res) for i, res in enumerate(quality_results) if not res.passed]
+
+            if not passing_indices:
+                quality_failure = select_quality_failure(quality_results)
+                assert quality_failure is not None
+                qc_dict = _quality_check_dict(quality_failure)
+                logger.warning("Job %s rejected pre-OCR in worker (code=%s)", job_id, qc_dict["rejection_code"])
+                await _reject_post_ocr(
+                    job_id,
+                    receipt_id,
+                    callback_url,
+                    {},
+                    rejection_code=qc_dict["rejection_code"],
+                    rejection_reason=qc_dict["rejection_reason"],
+                    quality_check=qc_dict,
+                )
+                return
+
+            content_hash = compute_content_hash(
+                raw_bytes_list, country=country, currency=currency, location=location
+            )
+
+            if not failing_entries and not force_process:
+                cached_ocr = await get_cached_ocr_result(content_hash)
+                if _is_valid_cached_ocr_result(cached_ocr):
+                    logger.info("Bypassing OCR pipeline via 90-day hash cache hit (job=%s)", job_id)
+                    await _serve_cached_ocr_result(
+                        job_id=job_id,
+                        receipt_id=receipt_id,
+                        callback_url=callback_url,
+                        source_service=source_service,
+                        force_process=force_process,
+                        cached_ocr=cached_ocr,
+                    )
+                    return
+                elif cached_ocr is not None:
+                    logger.info(
+                        "Ignoring stale/incomplete 90-day cache hit (job=%s, cache_version=%s)",
+                        job_id,
+                        cached_ocr.get("cache_version"),
+                    )
+
+            # Sub-tile tall passing segments if virtual tiling is enabled
+            tiled_entries: list[tuple[int, Image.Image]] = []
+            for s_idx in passing_indices:
+                s_img = source_images[s_idx]
+                if settings.ocr_virtual_tiling:
                     strips = split_tall_image_into_strips(s_img, max_strips=3)
-                    if len(strips) > 1 and len(expanded_segments) + len(strips) <= 10:
+                    if len(strips) > 1 and len(tiled_entries) + len(strips) <= 10:
                         for strip in strips:
                             strip._parent_segment_index = s_idx
-                        expanded_segments.extend(strips)
-                    else:
-                        expanded_segments.append(s_img)
-                segment_images = expanded_segments
+                        tiled_entries.extend((s_idx, strip) for strip in strips)
+                        continue
+                tiled_entries.append((s_idx, s_img))
 
-            images = segment_images
+            t0_fast = time.perf_counter()
+            loop = asyncio.get_running_loop()
+            ocr_tasks = [
+                loop.run_in_executor(ocr_executor, read_segment_fast, seg_img, "eng")
+                for _, seg_img in tiled_entries
+            ]
+            ocr_results = await asyncio.gather(*ocr_tasks, return_exceptions=True)
+            indexed_readings: list[tuple[int, Image.Image, OcrReading]] = []
+            for (s_idx, seg_img), res in zip(tiled_entries, ocr_results):
+                if isinstance(res, Exception):
+                    logger.warning("Segment %s fast OCR failed: %s", s_idx, res)
+                    continue
+                indexed_readings.append((s_idx, seg_img, res))
+            t_fast_ocr = time.perf_counter() - t0_fast
+
+            if not indexed_readings:
+                if failing_entries:
+                    quality_failure = select_quality_failure(res for _, res in failing_entries)
+                    assert quality_failure is not None
+                    qc_dict = _quality_check_dict(quality_failure)
+                    await _reject_post_ocr(
+                        job_id,
+                        receipt_id,
+                        callback_url,
+                        {},
+                        rejection_code=qc_dict["rejection_code"],
+                        rejection_reason=qc_dict["rejection_reason"],
+                        quality_check=qc_dict,
+                    )
+                    return
+                raise RuntimeError("All segments failed fast OCR")
+
+            groups = group_segments_into_receipts(indexed_readings)
+
+            if failing_entries:
+                has_incomplete_group = any(
+                    (not g.is_self_contained) or (g.total_amount is None and not g.reconciled)
+                    for g in groups
+                )
+                if has_incomplete_group:
+                    quality_failure = select_quality_failure(res for _, res in failing_entries)
+                    assert quality_failure is not None
+                    qc_dict = _quality_check_dict(quality_failure)
+                    logger.warning(
+                        "Job %s rejected pre-OCR in worker (incomplete fragment alongside failing segment, code=%s)",
+                        job_id, qc_dict["rejection_code"],
+                    )
+                    await _reject_post_ocr(
+                        job_id,
+                        receipt_id,
+                        callback_url,
+                        {},
+                        rejection_code=qc_dict["rejection_code"],
+                        rejection_reason=qc_dict["rejection_reason"],
+                        quality_check=qc_dict,
+                    )
+                    return
+
+            total_groups = len(groups) + len(failing_entries)
+            if total_groups > 1:
+                await _process_multi_group_batch(
+                    job_id=job_id,
+                    receipt_id=receipt_id,
+                    callback_url=callback_url,
+                    source_service=source_service,
+                    force_process=force_process,
+                    source_images=source_images,
+                    groups=groups,
+                    failing_entries=failing_entries,
+                    country=country,
+                    currency=currency,
+                    location=location,
+                )
+                return
+
+            precomputed_group_segments = groups[0].segments
+            images = [img for img, _ in precomputed_group_segments]
         else:
             primary_url = file_url or (file_urls[0] if file_urls else "")
             file_bytes = await download_file(primary_url)
@@ -411,98 +902,60 @@ async def process_receipt(
                     images = strips
                     is_multipart = True
 
-        # Reject receipts/PDFs that fail pre-OCR quality checks before OCR or cache lookup (non-overridable).
-        quality_failure = await asyncio.to_thread(
-            _pre_ocr_quality_failure,
-            source_images,
-            is_multi_page_pdf=is_multi_page_pdf,
-        )
-        if quality_failure is not None:
-            rej_code = quality_failure.rejection_code or "quality_failed"
-            rej_reason = quality_failure.rejection_reason or "Image quality check failed."
-            logger.warning("Job %s rejected pre-OCR in worker (code=%s)", job_id, rej_code)
-            await _reject_post_ocr(
-                job_id,
-                receipt_id,
-                callback_url,
-                {},
-                rejection_code=rej_code,
-                rejection_reason=rej_reason,
-                quality_check={
-                    "rejection_code": rej_code,
-                    "rejection_reason": rej_reason,
-                    "blur_score": quality_failure.blur_score,
-                    "brightness": quality_failure.brightness,
-                    "resolution": list(quality_failure.resolution),
-                    "detected_issues": list(quality_failure.detected_issues),
-                },
+            # Reject receipts/PDFs that fail pre-OCR quality checks before OCR or cache lookup (non-overridable).
+            quality_failure = await asyncio.to_thread(
+                _pre_ocr_quality_failure,
+                source_images,
+                is_multi_page_pdf=is_multi_page_pdf,
             )
-            return
-
-        content_hash = compute_content_hash(
-            raw_bytes_list, country=country, currency=currency, location=location
-        )
-
-        if not force_process:
-            cached_ocr = await get_cached_ocr_result(content_hash)
-            if _is_valid_cached_ocr_result(cached_ocr):
-                logger.info("Bypassing OCR pipeline via 90-day hash cache hit (job=%s)", job_id)
-                combined_text = cached_ocr.get("combined_text", "")
-                t0_embed = time.perf_counter()
-                embedding = None
-                if combined_text.strip():
-                    try:
-                        embed_text = compact_text_for_embedding(combined_text)
-                        embedding = await asyncio.to_thread(
-                            EmbeddingGenerator.generate, embed_text
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning("Embedding generation failed for cached receipt %s: %s", receipt_id, exc)
-                await _store_embedding(receipt_id, source_service, combined_text, embedding)
-                t_embed = time.perf_counter() - t0_embed
-
-                t0_dup = time.perf_counter()
-                is_dup, dup_score, matches = await _evaluate_duplicate(
-                    receipt_id, source_service, combined_text, embedding
-                )
-                t_dup = time.perf_counter() - t0_dup
-
-                job_doc = dict(cached_ocr["job_document"])
-                job_doc["quality_override"] = force_process
-                job_doc["duplicate_check"] = {
-                    "is_duplicate": is_dup,
-                    "similarity_score": round(dup_score, 4) if dup_score is not None else None,
-                    "matches_count": len(matches),
-                }
-                await MongoDBClient.update_job_status(job_id, "completed", job_doc)
-
-                cb_payload = build_callback_payload(
-                    receipt_id=receipt_id,
-                    fields=cached_ocr["callback_fields"],
-                    confidence=cached_ocr["confidence"],
-                    status="rejected" if is_dup else "completed",
-                    items=cached_ocr.get("items", []),
-                    tax_basis=cached_ocr.get("tax_basis"),
-                    financial_reconciliation_status=cached_ocr.get("financial_reconciliation_status"),
-                    needs_manual_review=cached_ocr.get("needs_manual_review"),
-                    is_duplicate=is_dup,
-                    duplicate_similarity=dup_score,
-                    rejection_code="duplicate" if is_dup else None,
-                    rejection_reason="Duplicate receipt detected based on semantic similarity." if is_dup else None,
-                )
-                if not await send_callback(callback_url, cb_payload.model_dump()):
-                    raise RuntimeError(f"Callback failed to {callback_url}")
-                logger.info("Job %s completed via 90-day cache hit (t_embed=%.3fs, t_dup=%.3fs)", job_id, t_embed, t_dup)
-                return
-            elif cached_ocr is not None:
-                logger.info(
-                    "Ignoring stale/incomplete 90-day cache hit (job=%s, cache_version=%s)",
+            if quality_failure is not None:
+                qc_dict = _quality_check_dict(quality_failure)
+                logger.warning("Job %s rejected pre-OCR in worker (code=%s)", job_id, qc_dict["rejection_code"])
+                await _reject_post_ocr(
                     job_id,
-                    cached_ocr.get("cache_version"),
+                    receipt_id,
+                    callback_url,
+                    {},
+                    rejection_code=qc_dict["rejection_code"],
+                    rejection_reason=qc_dict["rejection_reason"],
+                    quality_check=qc_dict,
                 )
+                return
+
+            content_hash = compute_content_hash(
+                raw_bytes_list, country=country, currency=currency, location=location
+            )
+
+            if not force_process:
+                cached_ocr = await get_cached_ocr_result(content_hash)
+                if _is_valid_cached_ocr_result(cached_ocr):
+                    logger.info("Bypassing OCR pipeline via 90-day hash cache hit (job=%s)", job_id)
+                    await _serve_cached_ocr_result(
+                        job_id=job_id,
+                        receipt_id=receipt_id,
+                        callback_url=callback_url,
+                        source_service=source_service,
+                        force_process=force_process,
+                        cached_ocr=cached_ocr,
+                    )
+                    return
+                elif cached_ocr is not None:
+                    logger.info(
+                        "Ignoring stale/incomplete 90-day cache hit (job=%s, cache_version=%s)",
+                        job_id,
+                        cached_ocr.get("cache_version"),
+                    )
 
         t0_ocr = time.perf_counter()
-        if is_multipart:
+        if precomputed_group_segments is not None:
+            bundle, extraction, metrics, gap_suspected = await _extract_ordered_segment_group(
+                precomputed_group_segments,
+                caller_country=country,
+                caller_currency=currency,
+                caller_location=location,
+                initial_engine_time=t_fast_ocr,
+            )
+        elif is_multipart:
             bundle, extraction, metrics, gap_suspected = await _read_and_extract_segments(
                 images, caller_country=country, caller_currency=currency, caller_location=location
             )
@@ -539,28 +992,8 @@ async def process_receipt(
             )
             return
 
-        near_reconciled = bool(extraction.item_scan and extraction.item_scan.near_reconciled)
-        verification = verify(
-            extraction.as_dict(),
-            bundle.combined_text,
-            reconciled=extraction.reconciled,
-            locale_resolved=bool(extraction.locale and extraction.locale.resolved),
-            mean_word_confidence=bundle.confidence,
-            tax_id_ambiguous=_tax_id_ambiguous(extraction),
-            derived_fields=(
-                set(extraction.money.derived) if extraction.money else set()
-            ) | {"tax_basis", "financial_reconciliation_status", "needs_manual_review",
-                 "reported_total", "computed_total", "total_discrepancy", "discount_type"}
-            | ({"location"} if location else set()),
-            near_reconciled=near_reconciled,
-            segment_gap=gap_suspected,
-        )
-        breakdown = compute_confidence(
-            verification,
-            anchor_score=bundle.primary.score,
-            mean_word_confidence=bundle.confidence,
-            reconciled=extraction.reconciled,
-            locale_certainty=extraction.locale.certainty if extraction.locale else 0.0,
+        verification, breakdown = _verify_and_score(
+            bundle, extraction, location=location, gap_suspected=gap_suspected
         )
 
         post_verify_rejection = _evaluate_post_verify_rejection(
@@ -584,17 +1017,7 @@ async def process_receipt(
             return
 
         t0_embed = time.perf_counter()
-        embedding = None
-        if bundle.combined_text.strip():
-            try:
-                embed_text = compact_text_for_embedding(bundle.combined_text)
-                embedding = await asyncio.to_thread(
-                    EmbeddingGenerator.generate, embed_text
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Embedding generation failed for receipt %s: %s", receipt_id, exc
-                )
+        embedding = await _generate_embedding(bundle.combined_text, receipt_id)
         await _store_embedding(receipt_id, source_service, bundle.combined_text, embedding)
         t_embed = time.perf_counter() - t0_embed
 
@@ -615,20 +1038,9 @@ async def process_receipt(
             ),
         )
 
-        callback_fields = dict(verification.fields)
-        has_callback_semantics = bool(
-            extraction.financial_semantics
-            and extraction.financial_semantics.source in {"qwen", "ollama", "gemini", "llm"}
+        callback_fields, tax_basis_val, fin_recon_status, needs_review = _build_callback_field_dict(
+            extraction, verification
         )
-        if not has_callback_semantics:
-            for key in ("tax_basis", "financial_reconciliation_status"):
-                callback_fields.pop(key, None)
-
-        needs_review = bool(
-            verification.needs_manual_review or extraction.fields.get("needs_manual_review", False)
-        )
-        fin_recon_status = extraction.fields.get("financial_reconciliation_status")
-        tax_basis_val = extraction.fields.get("tax_basis") if has_callback_semantics else None
 
         payload = build_callback_payload(
             receipt_id=receipt_id,
@@ -637,10 +1049,8 @@ async def process_receipt(
             status="rejected" if is_dup else "completed",
             items=extraction.item_scan.payload() if extraction.item_scan else [],
             tax_basis=tax_basis_val,
-            financial_reconciliation_status=(
-                fin_recon_status if has_callback_semantics else None
-            ),
-            needs_manual_review=needs_review if needs_review else None,
+            financial_reconciliation_status=fin_recon_status,
+            needs_manual_review=needs_review,
             is_duplicate=is_dup,
             duplicate_similarity=dup_score,
             rejection_code="duplicate" if is_dup else None,
@@ -663,10 +1073,8 @@ async def process_receipt(
                 "callback_fields": callback_fields,
                 "items": extraction.item_scan.payload() if extraction.item_scan else [],
                 "tax_basis": tax_basis_val,
-                "financial_reconciliation_status": (
-                    fin_recon_status if has_callback_semantics else None
-                ),
-                "needs_manual_review": needs_review if needs_review else None,
+                "financial_reconciliation_status": fin_recon_status,
+                "needs_manual_review": needs_review,
             }
             await set_cached_ocr_result(content_hash, cache_data)
         except Exception as cache_exc:  # noqa: BLE001
@@ -691,6 +1099,55 @@ async def process_receipt(
             {"receipt_id": receipt_id, "status": "failed", "error": str(exc)},
         )
         raise
+
+
+async def _serve_cached_ocr_result(
+    *,
+    job_id: str,
+    receipt_id: int,
+    callback_url: str,
+    source_service: str,
+    force_process: bool,
+    cached_ocr: dict,
+) -> None:
+    combined_text = cached_ocr.get("combined_text", "")
+    t0_embed = time.perf_counter()
+    embedding = await _generate_embedding(combined_text, receipt_id)
+    await _store_embedding(receipt_id, source_service, combined_text, embedding)
+    t_embed = time.perf_counter() - t0_embed
+
+    t0_dup = time.perf_counter()
+    is_dup, dup_score, matches = await _evaluate_duplicate(
+        receipt_id, source_service, combined_text, embedding
+    )
+    t_dup = time.perf_counter() - t0_dup
+
+    job_doc = dict(cached_ocr["job_document"])
+    job_doc["quality_override"] = force_process
+    job_doc["duplicate_check"] = {
+        "is_duplicate": is_dup,
+        "similarity_score": round(dup_score, 4) if dup_score is not None else None,
+        "matches_count": len(matches),
+    }
+    await MongoDBClient.update_job_status(job_id, "completed", job_doc)
+
+    cb_payload = build_callback_payload(
+        receipt_id=receipt_id,
+        fields=cached_ocr["callback_fields"],
+        confidence=cached_ocr["confidence"],
+        status="rejected" if is_dup else "completed",
+        items=cached_ocr.get("items", []),
+        tax_basis=cached_ocr.get("tax_basis"),
+        financial_reconciliation_status=cached_ocr.get("financial_reconciliation_status"),
+        needs_manual_review=cached_ocr.get("needs_manual_review"),
+        is_duplicate=is_dup,
+        duplicate_similarity=dup_score,
+        rejection_code="duplicate" if is_dup else None,
+        rejection_reason="Duplicate receipt detected based on semantic similarity." if is_dup else None,
+    )
+    if not await send_callback(callback_url, cb_payload.model_dump()):
+        raise RuntimeError(f"Callback failed to {callback_url}")
+    logger.info("Job %s completed via 90-day cache hit (t_embed=%.3fs, t_dup=%.3fs)", job_id, t_embed, t_dup)
 
 
 async def _read_and_extract(
@@ -816,40 +1273,18 @@ def _rank_of(pair: tuple[OcrBundle, Extraction]) -> tuple[int, int, float]:
     )
 
 
-async def _read_and_extract_segments(
-    segment_images: list[Image.Image],
+async def _extract_ordered_segment_group(
+    ordered_pairs: list[tuple[Image.Image, OcrReading]],
     *,
     caller_country: str | None = None,
     caller_currency: str | None = None,
     caller_location: str | None = None,
+    initial_engine_time: float = 0.0,
 ) -> tuple[OcrBundle, Extraction, dict, bool]:
-    """Process multiple segments (multi-part uploads or virtual strips).
-
-    Runs fast OCR concurrently per segment, auto-orders them, removes seam duplicates,
-    and constructs a unified OcrBundle before running extraction.
-    """
-    metrics = {"engine": 0.0, "llm": 0.0}
-
-    # 1. Fast Pass across all segments
-    t0_engine = time.perf_counter()
+    """Merge an ordered segment group and extract structured fields (with region recovery & LLM assists)."""
+    metrics = {"engine": initial_engine_time, "llm": 0.0}
     loop = asyncio.get_running_loop()
-    valid_pairs: list[tuple[Image.Image, OcrReading]] = []
-    for idx, img in enumerate(segment_images):
-        try:
-            res = await loop.run_in_executor(ocr_executor, read_segment_fast, img, "eng")
-            valid_pairs.append((img, res))
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Segment %s fast OCR failed: %s", idx, exc)
 
-    metrics["engine"] += time.perf_counter() - t0_engine
-
-    if not valid_pairs:
-        raise RuntimeError("All segments failed fast OCR")
-
-    # 2. Auto-order segments
-    ordered_pairs = order_segments(valid_pairs)
-
-    # 3. Text-level seam merge
     merged_reading, gap_suspected = merge_segment_readings(ordered_pairs)
     merged_bundle = OcrBundle(
         primary=merged_reading,
@@ -858,7 +1293,6 @@ async def _read_and_extract_segments(
         early_exit=True,
     )
 
-    # 4. Fast deterministic extraction over merged reading
     embedder = _embedder()
     baseline = extract(
         merged_bundle,
@@ -878,7 +1312,6 @@ async def _read_and_extract_segments(
         await normalize_extraction(baseline, merged_bundle, use_llm=False)
         return merged_bundle, baseline, metrics, gap_suspected
 
-    # 5. Targeted region recovery: contrast-enhanced crop OCR for missing header/footer
     needs_total_recovery = baseline.fields.get("total_amount") is None or not baseline.reconciled
     needs_vendor_recovery = (
         baseline.fields.get("vendor_name") is None and baseline.fields.get("vendor_tax_id") is None
@@ -892,14 +1325,12 @@ async def _read_and_extract_segments(
         )
         t0_rec = time.perf_counter()
         recovery_tasks = []
-        if (needs_total_recovery or needs_date_recovery) and ordered_pairs:
-            # Bottom 35% of the last segment (where total/subtotal/footer-date resides)
+        if needs_total_recovery or needs_date_recovery:
             last_img, _ = ordered_pairs[-1]
             recovery_tasks.append(
                 loop.run_in_executor(ocr_executor, read_region_recovery, last_img, 0.65, 1.0, "eng")
             )
-        if (needs_vendor_recovery or needs_date_recovery or needs_location_recovery) and ordered_pairs:
-            # Top 30% of the first segment (where vendor/TIN/header-date/location resides)
+        if needs_vendor_recovery or needs_date_recovery or needs_location_recovery:
             first_img, _ = ordered_pairs[0]
             recovery_tasks.append(
                 loop.run_in_executor(ocr_executor, read_region_recovery, first_img, 0.0, 0.30, "eng")
@@ -923,7 +1354,6 @@ async def _read_and_extract_segments(
             merged_bundle.early_exit = False
             logger.info("Added %d recovered reading(s) to merged bundle", len(recovered_readings))
 
-    # 6. Extract with assists on merged bundle
     t0_llm = time.perf_counter()
     extraction = await _extract_with_assists(
         merged_bundle,
@@ -934,6 +1364,43 @@ async def _read_and_extract_segments(
     metrics["llm"] += time.perf_counter() - t0_llm
 
     return merged_bundle, extraction, metrics, gap_suspected
+
+
+async def _read_and_extract_segments(
+    segment_images: list[Image.Image],
+    *,
+    caller_country: str | None = None,
+    caller_currency: str | None = None,
+    caller_location: str | None = None,
+) -> tuple[OcrBundle, Extraction, dict, bool]:
+    """Process multiple segments (multi-part uploads or virtual strips).
+
+    Runs fast OCR per segment, auto-orders them, removes seam duplicates,
+    and constructs a unified OcrBundle before running extraction.
+    """
+    t0_engine = time.perf_counter()
+    loop = asyncio.get_running_loop()
+    valid_pairs: list[tuple[Image.Image, OcrReading]] = []
+    for idx, img in enumerate(segment_images):
+        try:
+            res = await loop.run_in_executor(ocr_executor, read_segment_fast, img, "eng")
+            valid_pairs.append((img, res))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Segment %s fast OCR failed: %s", idx, exc)
+
+    engine_time = time.perf_counter() - t0_engine
+
+    if not valid_pairs:
+        raise RuntimeError("All segments failed fast OCR")
+
+    ordered_pairs = order_segments(valid_pairs)
+    return await _extract_ordered_segment_group(
+        ordered_pairs,
+        caller_country=caller_country,
+        caller_currency=caller_currency,
+        caller_location=caller_location,
+        initial_engine_time=engine_time,
+    )
 
 
 async def _extract_with_assists(

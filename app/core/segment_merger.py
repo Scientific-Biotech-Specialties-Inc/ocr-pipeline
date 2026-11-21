@@ -18,9 +18,12 @@ from dataclasses import dataclass, field
 from PIL import Image
 from rapidfuzz import fuzz
 
-from app.core.anchors import DATE_RE, TAX_ID_RE, score_text
-from app.core.numbers import normalize_money
-from app.core.ocr_engine import OcrReading, Word
+from app.core.anchors import DATE_RE, MONEY_RE, TAX_ID_RE, score_text
+from app.core.extraction import extract
+from app.core.numbers import digits_only, normalize_money
+from app.core.ocr_engine import OcrBundle, OcrReading, Word
+from app.core.textquality import is_gobbly_vendor_name
+from app.core.vendor import ENTITY_MARKERS
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +31,9 @@ logger = logging.getLogger(__name__)
 QTY_PRICE_RE = re.compile(r"\b\d{1,3}\s*[xX×]\s*\d+[,.]\d{2}\b")
 PRICE_TAX_CODE_RE = re.compile(r"\b\d+[,.]\d{2}\s+[VvEeZz]\b")
 BARCODE_RE = re.compile(r"\b\d{8,14}\b")
+_BARE_QTY_OR_PRICE_RE = re.compile(
+    r"^\s*(?:\d{1,3}\s*[xX×@*]\s*\d+(?:[,.]\d{2})?(?:\s+\d+[,.]\d{2})?|\d+[,.]\d{2})(?:\s+[VvEeZzTt])?\s*$"
+)
 
 # Header & Footer anchor keywords
 HEADER_KEYWORDS = (
@@ -39,6 +45,49 @@ FOOTER_KEYWORDS = (
     "grand total", "cash", "tender", "change", "vatable sale", "vat (12%)",
     "vat exempt", "zero rated", "item purchased",
 )
+
+# Regulatory / tax-ID / printer-accreditation lines must always be ignored as
+# grouping seams even when they contain 8+ digit permit/MIN/PTU numbers.
+_REGULATORY_BOILERPLATE_RE = re.compile(
+    r"\b(?:bir|tin|ptu|min|ocn|atp|accreditation|authority\s+to\s+print|"
+    r"permit\s*no|serial\s*no|machine\s*id|telefax|tel\.?\s*no|phone)\b",
+    re.IGNORECASE,
+)
+
+# Generic receipt header/footer/summary lines that recur across unrelated receipts.
+_GENERIC_BOILERPLATE_RE = re.compile(
+    r"\b(?:"
+    r"thank\s+you|thanks|come\s+again|have\s+a\s+nice\s+day|please\s+retain"
+    r"|official\s+receipt|sales\s+invoice|provisional\s+receipt"
+    r"|collection\s+receipt|acknowledg(?:e)?ment\s+receipt|billing\s+statement"
+    r"|vatable\s+sales?|12%\s*vat|vat[-\s]+exempt|zero[-\s]+rated|non[-\s]*vat|vat"
+    r"|customer\s+copy|merchant\s+copy|cashier\s+copy|duplicate\s+copy|reprint"
+    r"|this\s+serves\s+as|valid\s+for\s+five|valid\s+until"
+    r"|pos|bir|tin|ptu|min|ocn|atp"
+    r"|sub[-\s]?total|grand\s+total|total\s+amount(?:\s+due)?|total\s+amt\s+due"
+    r"|amount\s+due|amt\s+due|total\s+sales|net\s+sales|total\s+due|balance\s+due"
+    r"|cash|change|tender(?:ed)?|payment|credit\s+card|debit\s+card"
+    r"|cashier|terminal|register|store\s*(?:#|no\.?|id|:|\d)|branch\s*(?:#|no\.?|id|:|\d)"
+    r")\b"
+    r"|\bvat\s*\(\s*12\s*%\s*\)"
+    r"|^\s*total(?:\s*[:=]|\s+[\d$pP€£¥]|$)",
+    re.IGNORECASE,
+)
+
+# Boundary markers indicating the start of receipt footer / regulatory blocks
+_FOOTER_OR_ATP_START_RE = re.compile(
+    r"\b(?:"
+    r"sub[-\s]?total|grand\s+total|total\s+amount(?:\s+due)?|total\s+amt\s+due"
+    r"|amount\s+due|amt\s+due|total\s+sales|vatable\s+sales?|vat\s+exempt"
+    r"|zero[-\s]+rated|cash|change|tender(?:ed)?|authority\s+to\s+print"
+    r"|date\s+of\s+atp|accreditation|ptu|bir\s+permit"
+    r")\b"
+    r"|\bvat\s*\(\s*12\s*%\s*\)",
+    re.IGNORECASE,
+)
+_BARE_TOTAL_LINE_RE = re.compile(r"^\s*total\s*[:=]?\s*(?:[$pP€£¥]?\s*\d|$)", re.IGNORECASE)
+
+ITEM_SEAM_OVERLAP_THRESHOLD = 1.0
 
 
 @dataclass
@@ -54,6 +103,37 @@ class SegmentRoleScore:
     def is_likely_middle(self) -> bool:
         """Middle segments have high item density but lack header/footer markers."""
         return self.item_row_count >= 5 and self.header_score < 2.0 and self.footer_score < 2.0
+
+
+@dataclass
+class SegmentAnalysis:
+    """Deterministic structural and identity summary of a single OCR segment."""
+
+    index: int
+    vendor_name: str | None = None
+    vendor_tax_id: str | None = None
+    invoice_number: str | None = None
+    transaction_date: str | None = None
+    currency: str | None = None
+    total_amount: float | None = None
+    reconciled: bool = False
+    has_header: bool = False
+    has_footer: bool = False
+    is_self_contained: bool = False
+    role_score: SegmentRoleScore = field(default_factory=SegmentRoleScore)
+
+
+@dataclass
+class ReceiptSegmentGroup:
+    """A group of segments belonging to a single receipt, ordered for merging."""
+
+    segment_indices: list[int]
+    segments: list[tuple[Image.Image, OcrReading]]
+    analyses: list[SegmentAnalysis] = field(default_factory=list)
+    is_self_contained: bool = False
+    vendor_name: str | None = None
+    total_amount: float | None = None
+    reconciled: bool = False
 
 
 def score_segment_density(text: str, mean_confidence: float = 0.0) -> SegmentRoleScore:
@@ -423,8 +503,15 @@ def _find_best_overlap_alignment(
     return best_match
 
 
-def _match_fingerprints(f1: LineFingerprint, f2: LineFingerprint) -> float:
+def _match_fingerprints(
+    f1: LineFingerprint, f2: LineFingerprint, *, ignore_boilerplate: bool = False
+) -> float:
     """Score whether two lines represent the same printed receipt line."""
+    if ignore_boilerplate and (
+        _is_generic_boilerplate_line(f1.text) or _is_generic_boilerplate_line(f2.text)
+    ):
+        return 0.0
+
     # 1. Barcode match (exact or 7+ char common suffix/substring)
     if f1.barcodes and f2.barcodes:
         if set(f1.barcodes) & set(f2.barcodes):
@@ -450,6 +537,438 @@ def _match_fingerprints(f1: LineFingerprint, f2: LineFingerprint) -> float:
             return 2.0
 
     return 0.0
+
+
+def _is_generic_boilerplate_line(text: str) -> bool:
+    """Return True for generic receipt boilerplate/headers/footers that should not link distinct receipts."""
+    stripped = text.strip()
+    if not stripped:
+        return True
+    if _REGULATORY_BOILERPLATE_RE.search(stripped):
+        return True
+    if BARCODE_RE.search(stripped) or QTY_PRICE_RE.search(stripped):
+        return False
+    return bool(_GENERIC_BOILERPLATE_RE.search(stripped))
+
+
+def _evaluate_item_seam_overlap(
+    lines_prev: list[list[Word]],
+    lines_next: list[list[Word]],
+    max_window: int = 30,
+) -> float:
+    """Score item/barcode seam overlap between tail of prev and head of next, ignoring boilerplate."""
+    if not lines_prev or not lines_next:
+        return 0.0
+
+    tail = [
+        fp
+        for fp in (LineFingerprint.from_line(ln) for ln in lines_prev[-max_window:])
+        if not _is_generic_boilerplate_line(fp.text)
+    ]
+    head = [
+        fp
+        for fp in (LineFingerprint.from_line(ln) for ln in lines_next[:max_window])
+        if not _is_generic_boilerplate_line(fp.text)
+    ]
+    if not tail or not head:
+        return 0.0
+
+    overlap_score = 0.0
+    for t in tail:
+        best_for_t = 0.0
+        for h in head:
+            score = _match_fingerprints(t, h, ignore_boilerplate=True)
+            if score > best_for_t:
+                best_for_t = score
+        overlap_score += best_for_t
+    return overlap_score
+
+
+def _header_region_lines(lines: list[str]) -> list[str]:
+    """Return lines from top of segment up to the first footer/total/ATP boundary."""
+    header_lines: list[str] = []
+    for line in lines:
+        if _FOOTER_OR_ATP_START_RE.search(line) or _BARE_TOTAL_LINE_RE.match(line):
+            break
+        header_lines.append(line)
+    return header_lines
+
+
+def _validate_header_vendor(
+    raw_vendor: str | None,
+    header_lines: list[str],
+    role: SegmentRoleScore,
+    header_role: SegmentRoleScore,
+) -> str | None:
+    """Reject footer boilerplate, price lines, and split-line item names mistaken for vendors."""
+    if not raw_vendor or not isinstance(raw_vendor, str):
+        return None
+    cleaned = raw_vendor.strip()
+    if not cleaned or is_gobbly_vendor_name(cleaned):
+        return None
+    if _is_generic_boilerplate_line(cleaned):
+        return None
+    if MONEY_RE.search(cleaned) or BARCODE_RE.search(cleaned) or QTY_PRICE_RE.search(cleaned):
+        return None
+
+    # Confirm the proposed vendor actually originates in the pre-footer header region
+    # and is not a split-line item name followed immediately by a bare qty/price row.
+    vendor_lower = cleaned.casefold()
+    match_idx: int | None = None
+    for idx, line in enumerate(header_lines):
+        line_lower = line.casefold()
+        if vendor_lower in line_lower or fuzz.ratio(vendor_lower, line_lower) >= 85:
+            match_idx = idx
+            break
+    if match_idx is None:
+        return None
+
+    if match_idx + 1 < len(header_lines):
+        next_line = header_lines[match_idx + 1].strip()
+        if _BARE_QTY_OR_PRICE_RE.match(next_line):
+            return None
+
+    has_entity_marker = any(marker in vendor_lower for marker in ENTITY_MARKERS)
+    if role.is_likely_middle and header_role.header_score < 1.0 and not has_entity_marker:
+        return None
+    return cleaned
+
+
+def analyze_segment(index: int, image: Image.Image, reading: OcrReading) -> SegmentAnalysis:
+    """Extract deterministic receipt identity and structural signals from one segment."""
+    if reading.anchors is None:
+        reading.anchors = score_text(reading.text, reading.confidence)
+
+    role = score_segment_density(reading.text, reading.confidence)
+    bundle = OcrBundle(primary=reading, supporting=[], all_readings=[reading], early_exit=True)
+    extraction = extract(bundle)
+    fields = extraction.fields
+
+    raw_lines = [ln.strip() for ln in reading.text.splitlines() if ln.strip()]
+    header_lines = _header_region_lines(raw_lines)
+    header_role = (
+        score_segment_density("\n".join(header_lines), reading.confidence)
+        if header_lines
+        else SegmentRoleScore()
+    )
+
+    total_amount = fields.get("total_amount")
+    if total_amount is not None and role.footer_score == 0.0 and role.is_likely_middle:
+        # Guard against a middle-segment item line containing the word 'total'
+        total_evidence = extraction.evidence.get("total_amount", "")
+        item_lines_after = 0
+        seen_total_line = False
+        for ln in raw_lines:
+            if not seen_total_line and ln in total_evidence:
+                seen_total_line = True
+                continue
+            if seen_total_line and (
+                QTY_PRICE_RE.search(ln) or PRICE_TAX_CODE_RE.search(ln) or BARCODE_RE.search(ln)
+            ):
+                item_lines_after += 1
+        if seen_total_line and item_lines_after >= 3:
+            total_amount = None
+
+    valid_vendor = _validate_header_vendor(
+        fields.get("vendor_name"), header_lines, role, header_role
+    )
+    has_header = (header_role.header_score >= 2.0) or (valid_vendor is not None)
+    vendor_name = valid_vendor if has_header else None
+
+    raw_tin = fields.get("vendor_tax_id")
+    norm_tin = digits_only(raw_tin) if raw_tin else ""
+    vendor_tax_id = norm_tin or None
+
+    reconciled = bool(
+        extraction.reconciled or (extraction.item_scan and extraction.item_scan.reconciled)
+    )
+    has_footer = (total_amount is not None) or (role.footer_score >= 2.0)
+    is_self_contained = bool(has_header and has_footer)
+
+    return SegmentAnalysis(
+        index=index,
+        vendor_name=vendor_name,
+        vendor_tax_id=vendor_tax_id,
+        invoice_number=fields.get("invoice_number"),
+        transaction_date=fields.get("transaction_date"),
+        currency=fields.get("currency"),
+        total_amount=total_amount,
+        reconciled=reconciled,
+        has_header=has_header,
+        has_footer=has_footer,
+        is_self_contained=is_self_contained,
+        role_score=role,
+    )
+
+
+def _has_identity_conflict(a: SegmentAnalysis, b: SegmentAnalysis) -> bool:
+    """Return True when two segments carry conflicting grounded receipt identities."""
+    if a.vendor_tax_id and b.vendor_tax_id:
+        tin_a = digits_only(a.vendor_tax_id)
+        tin_b = digits_only(b.vendor_tax_id)
+        if len(tin_a) >= 9 and len(tin_b) >= 9 and tin_a[:9] != tin_b[:9]:
+            return True
+
+    if a.invoice_number and b.invoice_number:
+        inv_a = re.sub(r"[^A-Za-z0-9]", "", str(a.invoice_number)).upper()
+        inv_b = re.sub(r"[^A-Za-z0-9]", "", str(b.invoice_number)).upper()
+        if inv_a and inv_b and inv_a != inv_b:
+            return True
+
+    if a.transaction_date and b.transaction_date:
+        if a.transaction_date.strip() != b.transaction_date.strip():
+            return True
+
+    if a.currency and b.currency and a.currency.strip().upper() != b.currency.strip().upper():
+        return True
+
+    if a.vendor_name and b.vendor_name:
+        if fuzz.token_set_ratio(a.vendor_name.casefold(), b.vendor_name.casefold()) < 65:
+            return True
+
+    if (
+        a.has_footer
+        and b.has_footer
+        and a.total_amount is not None
+        and b.total_amount is not None
+        and abs(a.total_amount - b.total_amount) > 0.01
+    ):
+        return True
+
+    return False
+
+
+@dataclass
+class _SourceUnit:
+    """Internal grouping unit representing one uploaded image (or its virtual strips)."""
+
+    source_indices: list[int]
+    segments: list[tuple[Image.Image, OcrReading]]
+    analysis: SegmentAnalysis
+
+    @property
+    def head_lines(self) -> list[list[Word]]:
+        return self.segments[0][1].lines if self.segments else []
+
+    @property
+    def tail_lines(self) -> list[list[Word]]:
+        return self.segments[-1][1].lines if self.segments else []
+
+
+def _partition_source_units(
+    indexed_segments: list[tuple[int, Image.Image, OcrReading]],
+) -> list[_SourceUnit]:
+    """Keep virtual strips of a single tall image locked together as one unit."""
+    all_unparented_strips = bool(indexed_segments) and all(
+        getattr(img, "_is_virtual_strip", False)
+        and getattr(img, "_parent_segment_index", None) is None
+        for _, img, _ in indexed_segments
+    )
+
+    buckets: dict[tuple, list[tuple[int, Image.Image, OcrReading]]] = {}
+    order: list[tuple] = []
+    for pos, (idx, img, reading) in enumerate(indexed_segments):
+        is_strip = bool(getattr(img, "_is_virtual_strip", False))
+        parent_idx = getattr(img, "_parent_segment_index", None)
+        if is_strip:
+            if all_unparented_strips:
+                key: tuple = ("single_tall", 0)
+            elif parent_idx is not None:
+                key = ("strip_parent", parent_idx)
+            else:
+                key = ("strip_idx", idx)
+        else:
+            key = ("seg", idx, pos)
+        if key not in buckets:
+            buckets[key] = []
+            order.append(key)
+        buckets[key].append((idx, img, reading))
+
+    units: list[_SourceUnit] = []
+    for key in order:
+        items = buckets[key]
+        if any(getattr(img, "_is_virtual_strip", False) for _, img, _ in items):
+            items.sort(key=lambda item: getattr(item[1], "_virtual_index", item[0]))
+        source_indices = sorted(
+            {
+                int(getattr(img, "_parent_segment_index", idx)
+                    if getattr(img, "_parent_segment_index", None) is not None
+                    else idx)
+                for idx, img, _ in items
+            }
+        )
+        seg_pairs = [(img, reading) for _, img, reading in items]
+        if len(seg_pairs) == 1:
+            unit_reading = seg_pairs[0][1]
+        else:
+            unit_reading, _ = merge_segment_readings(seg_pairs)
+        unit_analysis = analyze_segment(source_indices[0], seg_pairs[0][0], unit_reading)
+        units.append(
+            _SourceUnit(
+                source_indices=source_indices,
+                segments=seg_pairs,
+                analysis=unit_analysis,
+            )
+        )
+    return units
+
+
+def _unit_seam_score(unit_a: _SourceUnit, unit_b: _SourceUnit) -> float:
+    """Compute directional boundary item seam score between two source units."""
+    forward = 0.0
+    if not unit_a.analysis.has_footer and not unit_b.analysis.has_header:
+        forward = _evaluate_item_seam_overlap(unit_a.tail_lines, unit_b.head_lines)
+
+    backward = 0.0
+    if not unit_b.analysis.has_footer and not unit_a.analysis.has_header:
+        backward = _evaluate_item_seam_overlap(unit_b.tail_lines, unit_a.head_lines)
+
+    return max(forward, backward)
+
+
+def _group_aggregate_analysis(units: list[_SourceUnit]) -> SegmentAnalysis:
+    """Build combined SegmentAnalysis for a group of units."""
+    if len(units) == 1:
+        return units[0].analysis
+    ordered_segs = _order_units_segments(units)
+    merged_reading, _ = merge_segment_readings(ordered_segs)
+    return analyze_segment(units[0].source_indices[0], ordered_segs[0][0], merged_reading)
+
+
+def _order_units_segments(units: list[_SourceUnit]) -> list[tuple[Image.Image, OcrReading]]:
+    """Order units using order_segments() while keeping each unit's virtual strips contiguous."""
+    if len(units) <= 1:
+        return list(units[0].segments) if units else []
+
+    if all(len(u.segments) == 1 for u in units):
+        return order_segments([u.segments[0] for u in units])
+
+    reps: list[tuple[Image.Image, OcrReading]] = []
+    rep_to_unit: dict[int, _SourceUnit] = {}
+    for unit in units:
+        if len(unit.segments) == 1:
+            img, reading = unit.segments[0]
+            rep_img = Image.new("RGB", img.size) if getattr(img, "_is_virtual_strip", False) else img
+            rep = (rep_img, reading)
+        else:
+            merged_reading, _ = merge_segment_readings(unit.segments)
+            rep_img = Image.new("RGB", unit.segments[0][0].size)
+            rep = (rep_img, merged_reading)
+        reps.append(rep)
+        rep_to_unit[id(rep[1])] = unit
+
+    ordered_reps = order_segments(reps)
+    ordered_segments: list[tuple[Image.Image, OcrReading]] = []
+    for _, rep_reading in ordered_reps:
+        ordered_segments.extend(rep_to_unit[id(rep_reading)].segments)
+    return ordered_segments
+
+
+def _can_merge_into_group(
+    group_units: list[_SourceUnit],
+    group_analysis: SegmentAnalysis,
+    candidate: _SourceUnit,
+) -> tuple[bool, float]:
+    """Return (compatible, seam_score) for attaching candidate to an existing group."""
+    cand_analysis = candidate.analysis
+
+    if _has_identity_conflict(group_analysis, cand_analysis):
+        return False, 0.0
+    if any(_has_identity_conflict(u.analysis, cand_analysis) for u in group_units):
+        return False, 0.0
+
+    # Two self-contained receipts are distinct documents (including intra-batch duplicates).
+    if group_analysis.is_self_contained and cand_analysis.is_self_contained:
+        return False, 0.0
+
+    best_seam = max(_unit_seam_score(u, candidate) for u in group_units)
+    has_seam = best_seam >= ITEM_SEAM_OVERLAP_THRESHOLD
+
+    if group_analysis.has_header and cand_analysis.has_header and not has_seam:
+        return False, 0.0
+    if group_analysis.has_footer and cand_analysis.has_footer and not has_seam:
+        return False, 0.0
+
+    if group_analysis.is_self_contained and not has_seam:
+        return False, 0.0
+    if cand_analysis.is_self_contained and not has_seam:
+        return False, 0.0
+
+    if has_seam:
+        return True, best_seam
+
+    # Complementary parts without identity conflict
+    if group_analysis.has_header and not group_analysis.has_footer and not cand_analysis.has_header:
+        return True, 0.0
+    if not group_analysis.has_header and group_analysis.has_footer and not cand_analysis.has_footer:
+        return True, 0.0
+    if not group_analysis.has_header and not group_analysis.has_footer and not cand_analysis.is_self_contained:
+        return True, 0.0
+
+    return False, 0.0
+
+
+def group_segments_into_receipts(
+    indexed_segments: list[tuple[int, Image.Image, OcrReading]],
+) -> list[ReceiptSegmentGroup]:
+    """Group uploaded segments into distinct receipts while stitching connected parts."""
+    if not indexed_segments:
+        return []
+
+    units = _partition_source_units(indexed_segments)
+    if len(units) == 1:
+        unit = units[0]
+        return [
+            ReceiptSegmentGroup(
+                segment_indices=list(unit.source_indices),
+                segments=list(unit.segments),
+                analyses=[unit.analysis],
+                is_self_contained=unit.analysis.is_self_contained,
+                vendor_name=unit.analysis.vendor_name,
+                total_amount=unit.analysis.total_amount,
+                reconciled=unit.analysis.reconciled,
+            )
+        ]
+
+    groups_units: list[list[_SourceUnit]] = []
+    groups_analyses: list[SegmentAnalysis] = []
+
+    for unit in units:
+        best_group_idx: int | None = None
+        best_seam = -1.0
+
+        # Prefer highest seam overlap; on tie without seam, prefer most recent compatible incomplete group
+        for g_idx in range(len(groups_units) - 1, -1, -1):
+            ok, seam = _can_merge_into_group(groups_units[g_idx], groups_analyses[g_idx], unit)
+            if not ok:
+                continue
+            if seam > best_seam:
+                best_seam = seam
+                best_group_idx = g_idx
+
+        if best_group_idx is not None:
+            groups_units[best_group_idx].append(unit)
+            groups_analyses[best_group_idx] = _group_aggregate_analysis(groups_units[best_group_idx])
+        else:
+            groups_units.append([unit])
+            groups_analyses.append(unit.analysis)
+
+    result: list[ReceiptSegmentGroup] = []
+    for g_units, g_analysis in zip(groups_units, groups_analyses):
+        ordered_segs = _order_units_segments(g_units)
+        seg_indices = sorted({idx for u in g_units for idx in u.source_indices})
+        result.append(
+            ReceiptSegmentGroup(
+                segment_indices=seg_indices,
+                segments=ordered_segs,
+                analyses=[u.analysis for u in g_units],
+                is_self_contained=g_analysis.is_self_contained,
+                vendor_name=g_analysis.vendor_name,
+                total_amount=g_analysis.total_amount,
+                reconciled=g_analysis.reconciled,
+            )
+        )
+    return result
 
 
 def split_tall_image_into_strips(

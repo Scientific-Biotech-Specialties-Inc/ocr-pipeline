@@ -45,7 +45,7 @@ Submits a receipt for async processing. Accepts either a single `file_url` or a 
 }
 ```
 
-**Request (multi-part long receipt):**
+**Request (multi-part / Multi Receipt batch):**
 ```json
 {
   "receipt_id": 42,
@@ -58,6 +58,7 @@ Submits a receipt for async processing. Accepts either a single `file_url` or a 
   "source_service": "serms"
 }
 ```
+> **Note on Multi-Receipt Auto-Grouping:** When `file_urls` contains multiple images (`len >= 2`), the worker automatically distinguishes whether the uploads are segments of **one long receipt** (stitched seamlessly as before) or **multiple distinct receipts / mixed batches** (grouped via deterministic identity signals, header/footer completeness, and boilerplate-hardened item/barcode seam overlap).
 
 **Response (202 Accepted):**
 ```json
@@ -72,7 +73,7 @@ Submits a receipt for async processing. Accepts either a single `file_url` or a 
 
 Returned *synchronously* when the EXIF-normalized image fails size / brightness / faded / blur / non-receipt checks.
 On a single image, all applicable checks are evaluated: if all four pre-OCR gate groups fail (`too_small`, `too_dark` or `faded`, `blurry`, and `not_a_receipt`), the response reports `rejection_code: "quality_failed"` with a general quality/verification rejection message; otherwise a single code is chosen using the suppression and priority hierarchy `not_a_receipt > too_small > too_dark > faded > blurry` (`not_a_receipt` suppresses quality flags, and `too_dark` / `faded` suppress `blurry`).
-In multi-segment requests, segments are checked in parallel (`not_a_receipt` is prioritized first, then `quality_failed`, then `faded`, then the first failing segment) and `segment_index` identifies the reported failing image.
+In multi-segment requests (`len(file_urls) > 1`), segments are checked in parallel (`not_a_receipt` is prioritized first, then `quality_failed`, then `faded`, then the first failing segment). Synchronous `422` is returned when **all** non-PDF segments fail `check_image_quality`; when at least one segment passes, the API caches the downloaded bytes and returns `202 Accepted` so the worker can determine whether passing segments form complete separate receipts (isolating only the failing segment) or an incomplete fragment of a long receipt (rejecting the job).
 All pre-OCR quality rejections (`too_small`, `blurry`, `too_dark`, `faded`, `not_a_receipt`, `quality_failed`) are **strictly non-overridable** regardless of `force_process`.
 **No Celery job is queued and no callback is sent** unless `callback_url` is supplied (in which case a rejection callback is also dispatched). The client must surface `message` / `rejection_reason` as a toast or
 modal. A MongoDB audit row is still written with `status: "rejected"`; raw triggered flags (`quality_check.detected_issues`) are persisted internally in MongoDB `quality_check` (both on FastAPI `422` rejections and worker pre-OCR rejections), while the HTTP `422` response and webhook callback payload schemas remain unchanged with a single `rejection_code`.
@@ -156,4 +157,13 @@ Caller currency/country/location take priority over OCR context. Currency is val
 Callbacks may additionally include `tax_basis` (`inclusive|exclusive|unknown`), `financial_reconciliation_status`, and `needs_manual_review`. These are optional and legacy fields remain unchanged. Detailed semantics, evidence, reported/computed totals, discrepancy, tax-line breakdown, and review reasons are retained in the Mongo job document.
 
 For long receipts (>= 20 items), if item sums near-reconcile within 3% of subtotal/total, extracted items are preserved in `items`, `needs_manual_review` is set to `true`, `ocr_confidence_score` is capped at `0.79`, and the review reason is recorded as `near_reconciled`. If multi-segment ordering or overlap detection encounters an unexpected discontinuity, `needs_manual_review` is flagged with `segment_gap` (confidence capped at `0.75`).
+
+### Multi-Receipt Split Callback Fields (`segment_indices`, `split_receipts`)
+When `file_urls` resolves to **one** receipt (single image or multi-segment long receipt), `segment_indices` and `split_receipts` remain `None` and are **omitted** from the outbound callback JSON so existing single-receipt contracts are unchanged.
+
+When `file_urls` resolves to **multiple** receipt groups (`> 1`):
+- **Primary payload (Group 0):** carries `segment_indices` (0-based indices into `file_urls` belonging to Group 0) alongside all standard receipt fields (`status`, `vendor_name`, `total_amount`, `items`, `rejection_code`, `is_duplicate`, etc.).
+- **`split_receipts` (Groups `1..G-1`):** optional array of `SplitReceiptPayload` objects, each mirroring the standard receipt callback fields (with `receipt_id: null` before upstream creation) plus `segment_indices: int[]`.
+- **Isolated rejections & intra-batch duplicates:** Each group is evaluated independently through pre-OCR quality, post-OCR/post-verify rejection gates, pgvector duplicate lookup, and intra-batch cosine similarity (`>= DUPLICATE_SIMILARITY_THRESHOLD`). Failing or duplicate groups are marked `"rejected"` individually without discarding valid sibling groups.
+- **Child embedding persistence:** If the callback receiver returns JSON containing `data.split_receipt_ids` (ordered 1-to-1 with `split_receipts`), the worker persists `pgvector` embeddings for Group 0 (when `completed`) and each `completed` split child receipt ID.
 
