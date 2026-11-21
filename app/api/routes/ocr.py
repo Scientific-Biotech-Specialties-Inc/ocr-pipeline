@@ -67,7 +67,17 @@ async def process_receipt(
         segment_results = await asyncio.gather(*check_tasks)
         segment_results.sort(key=lambda x: x[0])
 
-        failing_res = select_quality_failure(item[3] for item in segment_results)
+        non_pdf_results = [item[3] for item in segment_results if item[3] is not None]
+        all_non_pdf_failed = bool(non_pdf_results) and all(
+            not res.passed for res in non_pdf_results
+        )
+        should_sync_reject = (len(urls) == 1) or all_non_pdf_failed
+
+        failing_res = (
+            select_quality_failure(item[3] for item in segment_results)
+            if should_sync_reject
+            else None
+        )
         failing_item = (
             next((item for item in segment_results if item[3] is failing_res), None)
             if failing_res is not None

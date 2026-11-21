@@ -101,15 +101,27 @@ class ReceiptItem(BaseModel):
         return str(value or "item")[:255]
 
 
-class OcrCallbackPayload(BaseModel):
-    """The outbound contract, mirroring SERMS' ``OcrCallbackRequest`` rules.
+_OPTIONAL_WHEN_NONE_KEYS = (
+    "tax_basis",
+    "financial_reconciliation_status",
+    "needs_manual_review",
+    "subtotal",
+    "discount_amount",
+    "discount_type",
+    "segment_indices",
+    "split_receipts",
+)
 
-    Enforced before sending. Previously the pipeline posted a raw dict straight
-    from the language model, so there was no type boundary at all between a 1.5B
-    model and the financial system.
-    """
 
-    receipt_id: int
+def _strip_optional_none_keys(data: dict[str, Any]) -> None:
+    for key in _OPTIONAL_WHEN_NONE_KEYS:
+        if data.get(key) is None:
+            data.pop(key, None)
+
+
+class _ReceiptCallbackFieldsBase(BaseModel):
+    """Shared receipt extraction fields and SERMS-compatible validators."""
+
     vendor_name: Optional[str] = Field(default=None, max_length=255)
     transaction_date: Optional[str] = None
     total_amount: Optional[float] = Field(default=None, ge=0)
@@ -180,18 +192,6 @@ class OcrCallbackPayload(BaseModel):
         allowed = {"unresolved", "reconciled", "computed", "reported", "reported_conflict", "computed_conflict"}
         return value if value in allowed else None
 
-    def model_dump(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        data = super().model_dump(*args, **kwargs)
-        # New fields are optional and omitted when unset, preserving legacy
-        # callback payload shape while exposing them when the pipeline has a value.
-        for key in (
-            "tax_basis", "financial_reconciliation_status", "needs_manual_review",
-            "subtotal", "discount_amount", "discount_type",
-        ):
-            if data.get(key) is None:
-                data.pop(key, None)
-        return data
-
     @field_validator("expense_category", mode="before")
     @classmethod
     def restrict_category(cls, value: Optional[str]) -> Optional[str]:
@@ -204,6 +204,135 @@ class OcrCallbackPayload(BaseModel):
             return None
         text = str(value).strip()
         return text or None
+
+    def model_dump(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        data = super().model_dump(*args, **kwargs)
+        # New fields are optional and omitted when unset, preserving legacy
+        # callback payload shape while exposing them when the pipeline has a value.
+        _strip_optional_none_keys(data)
+        if isinstance(data.get("split_receipts"), list):
+            for entry in data["split_receipts"]:
+                if isinstance(entry, dict):
+                    _strip_optional_none_keys(entry)
+        return data
+
+
+class SplitReceiptPayload(_ReceiptCallbackFieldsBase):
+    """Per-receipt payload emitted in ``split_receipts`` when a multi-file upload splits."""
+
+    receipt_id: Optional[int] = None
+    segment_indices: List[int] = Field(default_factory=list)
+
+
+class OcrCallbackPayload(_ReceiptCallbackFieldsBase):
+    """The outbound contract, mirroring SERMS' ``OcrCallbackRequest`` rules.
+
+    Enforced before sending. Previously the pipeline posted a raw dict straight
+    from the language model, so there was no type boundary at all between a 1.5B
+    model and the financial system.
+    """
+
+    receipt_id: int
+    segment_indices: Optional[List[int]] = None
+    split_receipts: Optional[List[SplitReceiptPayload]] = None
+
+
+def _map_callback_fields(
+    fields: dict[str, Any] | None = None,
+    confidence: float = 0.0,
+    status: str = "completed",
+    items: list[dict[str, Any]] | None = None,
+    error: str | None = None,
+    rejection_code: str | None = None,
+    rejection_reason: str | None = None,
+    is_duplicate: bool = False,
+    duplicate_similarity: float | None = None,
+    tax_basis: str | None = None,
+    financial_reconciliation_status: str | None = None,
+    needs_manual_review: bool | None = None,
+    subtotal: float | None = None,
+    discount_amount: float | None = None,
+    discount_type: str | None = None,
+) -> dict[str, Any]:
+    fields_dict = fields or {}
+    resolved_subtotal = subtotal if subtotal is not None else (
+        fields_dict.get("subtotal") if fields_dict.get("subtotal") is not None else fields_dict.get("net_sales")
+    )
+    resolved_discount_amount = discount_amount if discount_amount is not None else fields_dict.get("discount_amount")
+    resolved_discount_type = discount_type if discount_type is not None else fields_dict.get("discount_type")
+    if resolved_discount_amount is not None and resolved_discount_amount > 0 and not resolved_discount_type:
+        resolved_discount_type = "other"
+    return {
+        "vendor_name": fields_dict.get("vendor_name"),
+        "transaction_date": fields_dict.get("transaction_date"),
+        "total_amount": fields_dict.get("total_amount"),
+        "subtotal": resolved_subtotal,
+        "vat_amount": fields_dict.get("tax_amount"),
+        "discount_amount": resolved_discount_amount,
+        "discount_type": resolved_discount_type,
+        "tin": fields_dict.get("vendor_tax_id"),
+        "invoice_number": fields_dict.get("invoice_number"),
+        "vat_classification": fields_dict.get("vat_classification"),
+        "currency": fields_dict.get("currency"),
+        "expense_category": fields_dict.get("expense_category"),
+        "location": fields_dict.get("location"),
+        "ocr_confidence_score": max(0.0, min(float(confidence), 1.0)),
+        "is_duplicate": is_duplicate,
+        "duplicate_similarity": round(duplicate_similarity, 4) if duplicate_similarity is not None else None,
+        "items": _valid_items(items or []),
+        "status": status,
+        "error": error,
+        "rejection_code": rejection_code,
+        "rejection_reason": rejection_reason or error,
+        "tax_basis": fields_dict.get("tax_basis", tax_basis),
+        "financial_reconciliation_status": fields_dict.get(
+            "financial_reconciliation_status", financial_reconciliation_status
+        ),
+        "needs_manual_review": fields_dict.get("needs_manual_review", needs_manual_review),
+    }
+
+
+def build_split_receipt_payload(
+    segment_indices: list[int],
+    fields: dict[str, Any] | None = None,
+    confidence: float = 0.0,
+    status: str = "completed",
+    items: list[dict[str, Any]] | None = None,
+    error: str | None = None,
+    rejection_code: str | None = None,
+    rejection_reason: str | None = None,
+    is_duplicate: bool = False,
+    duplicate_similarity: float | None = None,
+    tax_basis: str | None = None,
+    financial_reconciliation_status: str | None = None,
+    needs_manual_review: bool | None = None,
+    subtotal: float | None = None,
+    discount_amount: float | None = None,
+    discount_type: str | None = None,
+    receipt_id: int | None = None,
+) -> SplitReceiptPayload:
+    """Build one split-receipt entry for ``OcrCallbackPayload.split_receipts``."""
+    return SplitReceiptPayload(
+        receipt_id=receipt_id,
+        segment_indices=list(segment_indices),
+        **_map_callback_fields(
+            fields=fields,
+            confidence=confidence,
+            status=status,
+            items=items,
+            error=error,
+            rejection_code=rejection_code,
+            rejection_reason=rejection_reason,
+            is_duplicate=is_duplicate,
+            duplicate_similarity=duplicate_similarity,
+            tax_basis=tax_basis,
+            financial_reconciliation_status=financial_reconciliation_status,
+            needs_manual_review=needs_manual_review,
+            subtotal=subtotal,
+            discount_amount=discount_amount,
+            discount_type=discount_type,
+        ),
+    )
 
 
 def build_callback_payload(
@@ -223,6 +352,8 @@ def build_callback_payload(
     subtotal: float | None = None,
     discount_amount: float | None = None,
     discount_type: str | None = None,
+    segment_indices: list[int] | None = None,
+    split_receipts: list[SplitReceiptPayload] | None = None,
 ) -> OcrCallbackPayload:
     """Map the internal field set onto the SERMS contract.
 
@@ -231,42 +362,27 @@ def build_callback_payload(
     country, currency, review reasons) is persisted on our side rather than
     transmitted and discarded.
     """
-    fields_dict = fields or {}
-    resolved_subtotal = subtotal if subtotal is not None else (
-        fields_dict.get("subtotal") if fields_dict.get("subtotal") is not None else fields_dict.get("net_sales")
-    )
-    resolved_discount_amount = discount_amount if discount_amount is not None else fields_dict.get("discount_amount")
-    resolved_discount_type = discount_type if discount_type is not None else fields_dict.get("discount_type")
-    if resolved_discount_amount is not None and resolved_discount_amount > 0 and not resolved_discount_type:
-        resolved_discount_type = "other"
     return OcrCallbackPayload(
         receipt_id=receipt_id,
-        vendor_name=fields_dict.get("vendor_name"),
-        transaction_date=fields_dict.get("transaction_date"),
-        total_amount=fields_dict.get("total_amount"),
-        subtotal=resolved_subtotal,
-        vat_amount=fields_dict.get("tax_amount"),
-        discount_amount=resolved_discount_amount,
-        discount_type=resolved_discount_type,
-        tin=fields_dict.get("vendor_tax_id"),
-        invoice_number=fields_dict.get("invoice_number"),
-        vat_classification=fields_dict.get("vat_classification"),
-        currency=fields_dict.get("currency"),
-        expense_category=fields_dict.get("expense_category"),
-        location=fields_dict.get("location"),
-        ocr_confidence_score=max(0.0, min(float(confidence), 1.0)),
-        is_duplicate=is_duplicate,
-        duplicate_similarity=round(duplicate_similarity, 4) if duplicate_similarity is not None else None,
-        items=_valid_items(items or []),
-        status=status,
-        error=error,
-        rejection_code=rejection_code,
-        rejection_reason=rejection_reason or error,
-        tax_basis=fields_dict.get("tax_basis", tax_basis),
-        financial_reconciliation_status=fields_dict.get(
-            "financial_reconciliation_status", financial_reconciliation_status
+        segment_indices=segment_indices,
+        split_receipts=split_receipts,
+        **_map_callback_fields(
+            fields=fields,
+            confidence=confidence,
+            status=status,
+            items=items,
+            error=error,
+            rejection_code=rejection_code,
+            rejection_reason=rejection_reason,
+            is_duplicate=is_duplicate,
+            duplicate_similarity=duplicate_similarity,
+            tax_basis=tax_basis,
+            financial_reconciliation_status=financial_reconciliation_status,
+            needs_manual_review=needs_manual_review,
+            subtotal=subtotal,
+            discount_amount=discount_amount,
+            discount_type=discount_type,
         ),
-        needs_manual_review=fields_dict.get("needs_manual_review", needs_manual_review),
     )
 
 
@@ -287,6 +403,6 @@ def _valid_items(raw_items: list[dict[str, Any]]) -> list[ReceiptItem]:
 
 __all__ = [
     "OcrProcessRequest", "OcrProcessResponse", "QualityRejectionResponse", "ReceiptItem",
-    "OcrCallbackPayload", "build_callback_payload", "EXPENSE_CATEGORIES",
-    "SUPPORTED_CURRENCIES",
+    "SplitReceiptPayload", "OcrCallbackPayload", "build_callback_payload",
+    "build_split_receipt_payload", "EXPENSE_CATEGORIES", "SUPPORTED_CURRENCIES",
 ]
